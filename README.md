@@ -58,18 +58,25 @@ The CLI uses Docling to parse PDF, DOCX, and XLSX and records page/section/table
 
 ## Deploy to Vercel
 
-1. Push this repository to GitHub and import it into Vercel. Keep the project root set to the repository root; Vercel should detect Next.js automatically. No custom `vercel.json`, build command, output directory, or install command is required.
-2. Use Node.js 20.9 or newer (the supported range is declared in `package.json`). Keep the package manager set to npm so Vercel uses the committed `package-lock.json`.
-3. Add these **server-side** environment variables in Vercel Project Settings → Environment Variables for every environment that should run the app (Production, and Preview if needed):
+The repository deploys as a single Next.js app. `vercel.json` selects the Next.js framework; Vercel’s default npm install and `next build` are used. The Python Docling CLI is **not** deployed as a Vercel service: run it locally when indexing documents.
+
+### Before the first deployment
+
+1. Create a Supabase project and a Cloudflare API token with Workers AI permission.
+2. In Supabase SQL Editor, apply `supabase/migrations/202610250001_initial_schema.sql`, then `supabase/migrations/202610250002_chat_response_cache.sql`.
+3. Index the sample corpus from your local machine. Follow [Index the sample corpus](#index-the-sample-corpus-explicit-local-action) below and run the command without `--dry-run`. Verify the documents appear after deployment through `/api/documents`.
+4. Push this repository to GitHub and import it in Vercel. Set the Vercel project **Root Directory** to the repository root (not `ingestion`). Leave the framework, install command, build command, and output directory on their detected/default settings.
+5. Set the Node.js version to 20.9 or newer, matching `package.json`.
+6. In Vercel Project Settings → Environment Variables, add these **server-side** values for Production and any Preview/Development environments you intend to use:
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `CLOUDFLARE_ACCOUNT_ID`
    - `CLOUDFLARE_API_TOKEN`
-4. Optional overrides are `CF_EMBEDDING_MODEL`, `CF_EMBEDDING_DIMENSIONS`, `CF_PRIMARY_TEXT_MODEL`, `CF_FALLBACK_TEXT_MODEL`, `RETRIEVAL_MIN_SCORE`, and `CHAT_CACHE_TTL_SECONDS`. Defaults are documented in `.env.example`. Do not add a `NEXT_PUBLIC_` prefix to secrets.
-5. Before using the deployment, apply `202610250001_initial_schema.sql` and then `202610250002_chat_response_cache.sql` to the Supabase project. Run the Docling ingestion CLI locally to index the documents; Vercel does not run ingestion as part of the build.
-6. Redeploy after changing Vercel environment variables. Verify `/` and `/api/documents`; chat answers additionally require the migrations, indexed documents, and valid Cloudflare Workers AI credentials.
+7. Optionally set the model/cache overrides from `.env.example`: `CF_EMBEDDING_MODEL`, `CF_EMBEDDING_DIMENSIONS`, `CF_PRIMARY_TEXT_MODEL`, `CF_FALLBACK_TEXT_MODEL`, `RETRIEVAL_MIN_SCORE`, and `CHAT_CACHE_TTL_SECONDS`. Defaults are listed there. Never add a `NEXT_PUBLIC_` prefix to secrets.
+8. Deploy. Redeploy after changing Vercel environment variables.
+9. Smoke-test the deployment: open `/`, then `/api/documents` and confirm the indexed files are listed. Ask a question whose answer exists in the sample corpus and confirm the response includes citations.
 
-The chat and document API routes explicitly use the Node.js runtime. Chat requests have a 30-second maximum duration. Deploying this code does not itself configure external credentials, apply database migrations, ingest documents, or perform a Vercel deployment.
+The chat and document API routes explicitly use the Node.js runtime. Chat requests have a 30-second maximum duration. Vercel cannot apply database migrations or ingest local files as part of the Next.js build. The service-role key and Cloudflare token must stay server-side. A Vercel deployment does not automatically create Supabase/Cloudflare accounts, configure secrets, or populate the index.
 
 ## Checks
 
