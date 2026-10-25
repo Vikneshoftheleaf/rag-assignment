@@ -1,0 +1,14 @@
+[project]
+name = "silverline-doc-ingestion"
+version = "1.0.0"
+description = "Docling-based CLI for indexing the illustrative Silverline document corpus"
+requires-python = ">=3.10"
+dependencies = [
+  "docling>=2.50,<3",
+  "openpyxl>=3.1,<4",
+  "python-dotenv>=1.0,<2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
