@@ -93,6 +93,108 @@ async function cloudflareGenerate(messages: ChatMessage[], model: string): Promi
   return text;
 }
 
+async function cloudflareGenerateStream(
+  messages: ChatMessage[],
+  model: string,
+): Promise<AsyncIterable<string>> {
+  const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
+  const token = requiredEnv("CLOUDFLARE_API_TOKEN");
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${modelPath(model)}`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages,
+        max_tokens: 900,
+        temperature: 0.15,
+        stream: true,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    },
+  );
+  if (!response.ok) {
+    throw new ProviderError(
+      `Cloudflare Workers AI (${model}) returned HTTP ${response.status}`,
+      response.status === 429 || response.status >= 500,
+    );
+  }
+  if (!response.body) {
+    throw new ProviderError(`Cloudflare Workers AI (${model}) returned no stream`, true);
+  }
+
+  return parseCloudflareTextStream(response.body, model);
+}
+
+async function* parseCloudflareTextStream(
+  body: ReadableStream<Uint8Array>,
+  model: string,
+): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let receivedText = false;
+
+  function parseLine(line: string): string | null {
+    if (!line.startsWith("data:")) return null;
+    const data = line.slice(5).trim();
+    if (!data || data === "[DONE]") return null;
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      throw new ProviderError(`Cloudflare Workers AI (${model}) returned invalid stream data`, true);
+    }
+
+    if (!payload || typeof payload !== "object") return null;
+    const record = payload as { response?: unknown; result?: { response?: unknown } };
+    const token = typeof record.response === "string"
+      ? record.response
+      : typeof record.result?.response === "string"
+        ? record.result.response
+        : "";
+    return token || null;
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const token = parseLine(line);
+        if (token) {
+          receivedText = true;
+          yield token;
+        }
+      }
+      if (done) break;
+    }
+
+    if (buffer) {
+      const token = parseLine(buffer);
+      if (token) {
+        receivedText = true;
+        yield token;
+      }
+    }
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw new ProviderError(
+      `Cloudflare Workers AI (${model}) stream failed`,
+      !receivedText && transientFailure(error),
+    );
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!receivedText) {
+    throw new ProviderError(`Cloudflare Workers AI (${model}) returned no answer`, true);
+  }
+}
+
 async function cloudflareTranscriptionRequest(model: string, body: unknown): Promise<Response> {
   const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
   const token = requiredEnv("CLOUDFLARE_API_TOKEN");
@@ -163,5 +265,34 @@ export async function generateWithFallback(
     const shouldRetry = error instanceof ProviderError ? error.retryable : transientFailure(error);
     if (!shouldRetry) throw error;
     return { text: await fallback(messages), provider: "cloudflare-fallback" };
+  }
+}
+
+export async function* generateStreamWithFallback(
+  messages: ChatMessage[],
+  primary = (input: ChatMessage[]) => cloudflareGenerateStream(
+    input,
+    process.env.CF_PRIMARY_TEXT_MODEL || primaryTextModel,
+  ),
+  fallback = (input: ChatMessage[]) => cloudflareGenerateStream(
+    input,
+    process.env.CF_FALLBACK_TEXT_MODEL || fallbackTextModel,
+  ),
+): AsyncGenerator<{ text: string; provider: "cloudflare-primary" | "cloudflare-fallback" }> {
+  let hasEmittedText = false;
+  try {
+    const stream = await primary(messages);
+    for await (const text of stream) {
+      hasEmittedText = true;
+      yield { text, provider: "cloudflare-primary" };
+    }
+  } catch (error) {
+    const shouldRetry = error instanceof ProviderError ? error.retryable : transientFailure(error);
+    if (hasEmittedText || !shouldRetry) throw error;
+
+    const stream = await fallback(messages);
+    for await (const text of stream) {
+      yield { text, provider: "cloudflare-fallback" };
+    }
   }
 }

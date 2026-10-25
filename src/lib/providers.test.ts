@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   generateWithFallback,
+  generateStreamWithFallback,
   ProviderError,
   transcribeWithFallback,
 } from "./providers";
@@ -15,6 +16,88 @@ describe("answer provider fallback", () => {
     );
     expect(result).toEqual({ text: "primary answer", provider: "cloudflare-primary" });
     expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("streams text from the primary model as incremental chunks", async () => {
+    const primary = vi.fn(async () => (async function* () {
+      yield "A streamed";
+      yield " answer.";
+    })());
+    const fallback = vi.fn(async () => (async function* () { yield "backup"; })());
+    const chunks = [];
+    for await (const chunk of generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      primary,
+      fallback,
+    )) chunks.push(chunk);
+
+    expect(chunks).toEqual([
+      { text: "A streamed", provider: "cloudflare-primary" },
+      { text: " answer.", provider: "cloudflare-primary" },
+    ]);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("falls back when the primary stream fails before emitting answer text", async () => {
+    const fallback = vi.fn(async () => (async function* () {
+      yield "backup answer";
+    })());
+    const chunks = [];
+    for await (const chunk of generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      async () => { throw new ProviderError("rate limited", true); },
+      fallback,
+    )) chunks.push(chunk);
+
+    expect(chunks).toEqual([{ text: "backup answer", provider: "cloudflare-fallback" }]);
+    expect(fallback).toHaveBeenCalledOnce();
+  });
+
+  it("does not switch models after primary text has already streamed", async () => {
+    const fallback = vi.fn(async () => (async function* () { yield "backup"; })());
+    const primary = async () => (async function* () {
+      yield "partial";
+      throw new ProviderError("stream interrupted", true);
+    })();
+
+    const stream = generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      primary,
+      fallback,
+    );
+    await expect(stream.next()).resolves.toEqual({
+      done: false,
+      value: { text: "partial", provider: "cloudflare-primary" },
+    });
+    await expect(stream.next()).rejects.toThrow("stream interrupted");
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("parses Cloudflare SSE chunks and requests streaming generation", async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"response":"Hello"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"response":" world"}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    }), { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "test-account");
+    vi.stubEnv("CLOUDFLARE_API_TOKEN", "test-token");
+
+    try {
+      const chunks = [];
+      for await (const chunk of generateStreamWithFallback([{ role: "user", content: "question" }])) {
+        chunks.push(chunk);
+      }
+      expect(chunks.map((chunk) => chunk.text)).toEqual(["Hello", " world"]);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).stream).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
   });
 
   describe("speech provider fallback", () => {

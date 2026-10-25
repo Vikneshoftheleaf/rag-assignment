@@ -18,6 +18,7 @@ import {
   Sparkles,
   Square,
   TriangleAlert,
+  UserRound,
 } from "lucide-react";
 import type { ChatResponse, Citation, IndexedDocument } from "@/lib/types";
 
@@ -28,6 +29,7 @@ type ChatTurn = {
   citations: Citation[];
   abstained: boolean;
   pending?: boolean;
+  status?: string;
   error?: string;
 };
 
@@ -96,6 +98,9 @@ function MarkdownAnswer({ turn, onOpenSources }: {
     a: ({ href, children, ...props }) => {
       if (href?.startsWith("#citation-")) {
         const citationId = href.slice("#citation-".length);
+        if (turn.pending) {
+          return <span className="inline-citation" title="Sources appear when the answer is complete">{children}</span>;
+        }
         return (
           <button
             type="button"
@@ -213,19 +218,84 @@ export default function Home() {
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
         body: JSON.stringify({ message }),
       });
-      const payload = (await response.json()) as ChatResponse & { error?: string };
-      if (!response.ok) throw new Error(payload.error || "Something went wrong.");
-      const citations = payload.citations || [];
-      setTurns((existing) => existing.map((turn) => turn.id === turnId
-        ? { ...turn, answer: payload.answer, citations, abstained: payload.abstained, pending: false }
-        : turn));
-      setActiveSources(citations);
+      if (!response.ok) {
+        const payload = await response.json() as { error?: string };
+        throw new Error(payload.error || "Something went wrong.");
+      }
+
+      if (response.headers.get("content-type")?.includes("application/json")) {
+        const payload = await response.json() as ChatResponse;
+        const citations = payload.citations || [];
+        setTurns((existing) => existing.map((turn) => turn.id === turnId
+          ? { ...turn, answer: payload.answer, citations, abstained: payload.abstained, pending: false }
+          : turn));
+        setActiveSources(citations);
+      } else {
+        if (!response.body) throw new Error("The assistant did not return a response stream.");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let streamedAnswer = "";
+        let receivedFinal = false;
+
+        const handleEvent = (block: string) => {
+          const lines = block.replace(/\r/g, "").split("\n");
+          const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+          const data = lines.filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim())
+            .join("\n");
+          if (!event || !data) return;
+          const payload = JSON.parse(data) as ChatResponse & {
+            text?: string;
+            status?: string;
+            error?: string;
+          };
+
+          if (event === "status" && payload.status) {
+            setTurns((existing) => existing.map((turn) => turn.id === turnId
+              ? { ...turn, status: payload.status }
+              : turn));
+          } else if (event === "token" && payload.text) {
+            streamedAnswer += payload.text;
+            setTurns((existing) => existing.map((turn) => turn.id === turnId
+              ? { ...turn, answer: streamedAnswer, pending: true }
+              : turn));
+          } else if (event === "final") {
+            receivedFinal = true;
+            const citations = payload.citations || [];
+            setTurns((existing) => existing.map((turn) => turn.id === turnId
+              ? {
+                ...turn,
+                answer: payload.answer,
+                citations,
+                abstained: payload.abstained,
+                pending: false,
+                status: undefined,
+              }
+              : turn));
+            setActiveSources(citations);
+          } else if (event === "error") {
+            throw new Error(payload.error || "Something went wrong.");
+          }
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value, { stream: !done });
+          const blocks = buffer.split(/\r?\n\r?\n/);
+          buffer = blocks.pop() || "";
+          for (const block of blocks) handleEvent(block);
+          if (done) break;
+        }
+        if (buffer.trim()) handleEvent(buffer);
+        if (!receivedFinal) throw new Error("The assistant response ended unexpectedly.");
+      }
     } catch (error) {
       setTurns((existing) => existing.map((turn) => turn.id === turnId
-        ? { ...turn, pending: false, error: error instanceof Error ? error.message : "Could not reach the assistant." }
+        ? { ...turn, pending: false, status: undefined, error: error instanceof Error ? error.message : "Could not reach the assistant." }
         : turn));
       setActiveSources([]);
     } finally {
@@ -438,23 +508,39 @@ export default function Home() {
                 <div className="turn-list">
                   {turns.map((turn) => (
                     <article className="turn" key={turn.id}>
-                      <div className="user-question"><p>{turn.question}</p></div>
-                      {turn.error ? (
-                        <div className="error-box"><TriangleAlert size={17} /><span>{turn.error}</span><button onClick={() => void ask(turn.question)}>Try again</button></div>
-                      ) : turn.pending ? (
-                        <div className="loading-row"><LoaderCircle className="spinner" size={18} /><span>Thinking…</span></div>
+                      <div className="user-message-row">
+                        <div className="user-question"><p>{turn.question}</p></div>
+                        <span className="conversation-avatar user-avatar" aria-label="You">
+                          <UserRound size={16} />
+                        </span>
+                      </div>
+                      {turn.error && !turn.answer ? (
+                        <div className="assistant-message-row">
+                          <span className="conversation-avatar assistant-avatar" aria-label="AI assistant"><Sparkles size={16} /></span>
+                          <div className="error-box"><TriangleAlert size={17} /><span>{turn.error}</span><button onClick={() => void ask(turn.question)}>Try again</button></div>
+                        </div>
+                      ) : turn.pending && !turn.answer ? (
+                        <div className="assistant-message-row">
+                          <span className="conversation-avatar assistant-avatar" aria-label="AI assistant"><Sparkles size={16} /></span>
+                          <div className="loading-row"><LoaderCircle className="spinner" size={18} /><span>{turn.status || "Thinking…"}</span></div>
+                        </div>
                       ) : (
-                        <div className={`assistant-answer ${turn.abstained ? "abstained" : ""}`}>
-                          <div className="answer-content">
-                            {turn.abstained && <div className="abstain-tag">NOT FOUND IN SAMPLE SOURCES</div>}
-                            <MarkdownAnswer
-                              turn={turn}
-                              onOpenSources={(sources) => {
-                                setActiveSources(sources);
-                                setSourceView("answer");
-                                setSourcesOpen(true);
-                              }}
-                            />
+                        <div className="assistant-message-row">
+                          <span className="conversation-avatar assistant-avatar" aria-label="AI assistant"><Sparkles size={16} /></span>
+                          <div className={`assistant-answer ${turn.abstained ? "abstained" : ""}`}>
+                            <div className="answer-content">
+                              {turn.abstained && <div className="abstain-tag">NOT FOUND IN SAMPLE SOURCES</div>}
+                              <MarkdownAnswer
+                                turn={turn}
+                                onOpenSources={(sources) => {
+                                  setActiveSources(sources);
+                                  setSourceView("answer");
+                                  setSourcesOpen(true);
+                                }}
+                              />
+                            </div>
+                            {turn.pending && <div className="loading-row stream-indicator"><LoaderCircle className="spinner" size={15} /><span>{turn.status || "Writing answer…"}</span></div>}
+                            {turn.error && <div className="stream-error" role="alert">{turn.error}</div>}
                           </div>
                         </div>
                       )}

@@ -7,9 +7,10 @@ import {
   readCachedResponse,
   writeCachedResponse,
 } from "@/lib/chat-cache";
-import { generateWithFallback } from "@/lib/providers";
+import { generateStreamWithFallback, generateWithFallback } from "@/lib/providers";
 import { formatCitations, getSupabase, keepCitedSources, retrieveEvidence } from "@/lib/retrieval";
 import { buildGroundedPrompt } from "@/lib/prompt";
+import { applyQueryPolicy } from "@/lib/query-policy";
 import type { ChatResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -20,6 +21,104 @@ const requestSchema = z.object({
 });
 
 const MIN_RELEVANCE = Number(process.env.RETRIEVAL_MIN_SCORE || "0.18");
+
+type StreamCallbacks = {
+  onStatus: (status: string) => void;
+  onToken: (token: string) => void;
+};
+
+async function answerQuestion(message: string, streamCallbacks?: StreamCallbacks): Promise<ChatResponse> {
+  streamCallbacks?.onStatus("Finding relevant passages…");
+  const supabase = getSupabase();
+  const questionKey = buildQuestionKey(message);
+  const corpusRevision = await getCorpusRevision(supabase);
+  const configurationHash = buildCacheConfigurationHash();
+  try {
+    const cached = await readCachedResponse(supabase, questionKey, corpusRevision, configurationHash);
+    if (cached) return cached;
+  } catch (error) {
+    console.error("Chat cache read failed; continuing without cache", error);
+  }
+
+  const retrieved = await retrieveEvidence(message);
+  const selected = retrieved.filter((record) => Number(record.score) >= MIN_RELEVANCE).slice(0, 6);
+  if (!selected.length) {
+    return {
+      answer: "I couldn’t find enough supporting information in the indexed Silverline sample documents to answer that.",
+      citations: [],
+      abstained: true,
+    };
+  }
+
+  const prompt = buildGroundedPrompt(message, selected);
+  let answer: string;
+  let provider: ChatResponse["provider"];
+  if (streamCallbacks) {
+    streamCallbacks.onStatus("Writing an answer from the sources…");
+    let generated = "";
+    for await (const chunk of generateStreamWithFallback(prompt)) {
+      generated += chunk.text;
+      provider = chunk.provider;
+      streamCallbacks.onToken(chunk.text);
+    }
+    answer = generated;
+  } else {
+    const result = await generateWithFallback(prompt);
+    answer = result.text;
+    provider = result.provider;
+  }
+
+  const cited = keepCitedSources(answer, formatCitations(selected));
+  const response: ChatResponse = {
+    answer: cited.answer,
+    citations: cited.citations,
+    abstained: false,
+    provider,
+  };
+  try {
+    await writeCachedResponse(supabase, questionKey, corpusRevision, configurationHash, response);
+  } catch (error) {
+    console.error("Chat cache write failed; returning generated answer", error);
+  }
+  return response;
+}
+
+function createEventStream(run: (emit: (event: string, data: unknown) => void) => Promise<void>) {
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const emit = (event: string, data: unknown) => {
+        if (cancelled) return;
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+      void run(emit).then(
+        () => {
+          if (!cancelled) controller.close();
+        },
+        (error: unknown) => {
+          console.error("Streaming chat request failed", error);
+          emit("error", {
+            error: "The assistant is temporarily unavailable. Check the server configuration and try again.",
+          });
+          if (!cancelled) controller.close();
+        },
+      );
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -33,40 +132,28 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Enter a question between 1 and 2000 characters." }, { status: 400 });
   }
 
-  try {
-    const supabase = getSupabase();
-    const questionKey = buildQuestionKey(parsed.data.message);
-    const corpusRevision = await getCorpusRevision(supabase);
-    const configurationHash = buildCacheConfigurationHash();
-    try {
-      const cached = await readCachedResponse(supabase, questionKey, corpusRevision, configurationHash);
-      if (cached) return NextResponse.json(cached);
-    } catch (error) {
-      console.error("Chat cache read failed; continuing without cache", error);
-    }
-
-    const retrieved = await retrieveEvidence(parsed.data.message);
-    const selected = retrieved.filter((record) => Number(record.score) >= MIN_RELEVANCE).slice(0, 6);
-    if (!selected.length) {
-      return NextResponse.json({
-        answer: "I couldn’t find enough supporting information in the indexed Silverline sample documents to answer that.",
-        citations: [],
-        abstained: true,
-      });
-    }
-    const result = await generateWithFallback(buildGroundedPrompt(parsed.data.message, selected));
-    const cited = keepCitedSources(result.text, formatCitations(selected));
+  const policy = applyQueryPolicy(parsed.data.message);
+  if (!policy.allowed) {
     const response: ChatResponse = {
-      answer: cited.answer,
-      citations: cited.citations,
-      abstained: false,
-      provider: result.provider,
+      answer: policy.answer,
+      citations: [],
+      abstained: true,
     };
-    try {
-      await writeCachedResponse(supabase, questionKey, corpusRevision, configurationHash, response);
-    } catch (error) {
-      console.error("Chat cache write failed; returning generated answer", error);
-    }
+    return NextResponse.json(response);
+  }
+
+  if (request.headers.get("accept")?.includes("text/event-stream")) {
+    return createEventStream(async (emit) => {
+      const response = await answerQuestion(parsed.data.message, {
+        onStatus: (status) => emit("status", { status }),
+        onToken: (text) => emit("token", { text }),
+      });
+      emit("final", response);
+    });
+  }
+
+  try {
+    const response = await answerQuestion(parsed.data.message);
     return NextResponse.json(response);
   } catch (error) {
     console.error("Chat request failed", error);
