@@ -11,14 +11,18 @@ export function getSupabase() {
   });
 }
 
-export async function retrieveEvidence(question: string): Promise<RetrievedRecord[]> {
+export async function retrieveEvidence(
+  question: string,
+  documentId?: string,
+): Promise<RetrievedRecord[]> {
   const embedding = await embedText(question);
-  const { data, error } = await getSupabase().rpc("hybrid_search", {
+  const { data, error } = await getSupabase().rpc(documentId ? "document_hybrid_search" : "hybrid_search", {
     query_embedding: JSON.stringify(embedding),
     query_text: question,
-    match_count: 8,
+    match_count: 20,
+    ...(documentId ? { target_document_id: documentId } : {}),
   });
-  if (error) throw new Error(`Supabase hybrid search failed: ${error.message}`);
+  if (error) throw new Error(`Supabase ${documentId ? "document " : ""}hybrid search failed: ${error.message}`);
   return (data || []) as RetrievedRecord[];
 }
 

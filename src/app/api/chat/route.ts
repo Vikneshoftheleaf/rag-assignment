@@ -14,10 +14,11 @@ import { applyQueryPolicy } from "@/lib/query-policy";
 import type { ChatResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 const requestSchema = z.object({
   message: z.string().trim().min(1).max(2000),
+  documentId: z.string().uuid().optional(),
 });
 
 const MIN_RELEVANCE = Number(process.env.RETRIEVAL_MIN_SCORE || "0.18");
@@ -27,10 +28,14 @@ type StreamCallbacks = {
   onToken: (token: string) => void;
 };
 
-async function answerQuestion(message: string, streamCallbacks?: StreamCallbacks): Promise<ChatResponse> {
+async function answerQuestion(
+  message: string,
+  streamCallbacks?: StreamCallbacks,
+  documentId?: string,
+): Promise<ChatResponse> {
   streamCallbacks?.onStatus("Finding relevant passages…");
   const supabase = getSupabase();
-  const questionKey = buildQuestionKey(message);
+  const questionKey = buildQuestionKey(documentId ? `${message}\ndocument:${documentId}` : message);
   const corpusRevision = await getCorpusRevision(supabase);
   const configurationHash = buildCacheConfigurationHash();
   try {
@@ -40,8 +45,15 @@ async function answerQuestion(message: string, streamCallbacks?: StreamCallbacks
     console.error("Chat cache read failed; continuing without cache", error);
   }
 
-  const retrieved = await retrieveEvidence(message);
-  const selected = retrieved.filter((record) => Number(record.score) >= MIN_RELEVANCE).slice(0, 6);
+  const retrieved = await retrieveEvidence(message, documentId);
+  const eligible = retrieved.filter((record) => Number(record.score) >= MIN_RELEVANCE);
+  const numericOrFinancialQuestion =
+    /\b(?:revenue|turnover|sales|price|amount|cost|expense|profit|loss|margin|ebitda|eps|financial|quarter|half[\s-]*year|fiscal|percentage|percent)\b/i
+      .test(message);
+  const ranked = numericOrFinancialQuestion
+    ? [...eligible.filter((record) => record.result_kind === "fact"), ...eligible.filter((record) => record.result_kind !== "fact")]
+    : eligible;
+  const selected = ranked.slice(0, documentId ? 20 : numericOrFinancialQuestion ? 12 : 6);
   if (!selected.length) {
     return {
       answer: "I couldn’t find enough supporting information in the indexed Silverline sample documents to answer that.",
@@ -147,13 +159,13 @@ export async function POST(request: Request) {
       const response = await answerQuestion(parsed.data.message, {
         onStatus: (status) => emit("status", { status }),
         onToken: (text) => emit("token", { text }),
-      });
+      }, parsed.data.documentId);
       emit("final", response);
     });
   }
 
   try {
-    const response = await answerQuestion(parsed.data.message);
+    const response = await answerQuestion(parsed.data.message, undefined, parsed.data.documentId);
     return NextResponse.json(response);
   } catch (error) {
     console.error("Chat request failed", error);

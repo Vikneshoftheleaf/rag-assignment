@@ -1,10 +1,16 @@
 const timeout = 12_000;
-const primaryTextModel = "@cf/qwen/qwen3-30b-a3b-fp8";
-const fallbackTextModel = "@cf/meta/llama-3.2-3b-instruct";
+const primaryTextModel = "@cf/openai/gpt-oss-120b";
+const fallbackTextModel = "@cf/openai/gpt-oss-20b";
 const primaryTranscriptionModel = "@cf/openai/whisper-large-v3-turbo";
 const fallbackTranscriptionModel = "@cf/openai/whisper";
+const responseMaxTokens = 1600;
+const maxResponseContinuations = 2;
 
-export type ChatMessage = { role: "system" | "user"; content: string };
+export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+type TextGenerationStream = AsyncIterable<string> & {
+  readonly finishReason?: string;
+};
 
 export class ProviderError extends Error {
   constructor(message: string, readonly retryable: boolean) {
@@ -35,6 +41,24 @@ async function readJson(response: Response, provider: string): Promise<Record<st
   } catch {
     throw new ProviderError(`${provider} returned invalid JSON`, true);
   }
+}
+
+function extractGeneratedText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const record = payload as {
+    response?: unknown;
+    result?: { response?: unknown; choices?: Array<{ message?: { content?: unknown } }> };
+    choices?: Array<{ message?: { content?: unknown } }>;
+  };
+  const candidates = [
+    record.response,
+    record.result?.response,
+    record.choices?.[0]?.message?.content,
+    record.result?.choices?.[0]?.message?.content,
+  ];
+  return candidates.find((candidate): candidate is string =>
+    typeof candidate === "string" && Boolean(candidate.trim()),
+  )?.trim() || "";
 }
 
 export async function embedText(text: string): Promise<number[]> {
@@ -70,7 +94,11 @@ export async function embedText(text: string): Promise<number[]> {
   return first as number[];
 }
 
-async function cloudflareGenerate(messages: ChatMessage[], model: string): Promise<string> {
+async function cloudflareGenerate(
+  messages: ChatMessage[],
+  model: string,
+  continuation = 0,
+): Promise<string> {
   const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
   const token = requiredEnv("CLOUDFLARE_API_TOKEN");
   const response = await fetch(
@@ -80,23 +108,35 @@ async function cloudflareGenerate(messages: ChatMessage[], model: string): Promi
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         messages,
-        max_tokens: 900,
+        max_tokens: responseMaxTokens,
         temperature: 0.15,
       }),
       signal: AbortSignal.timeout(timeout),
     },
   );
   const payload = await readJson(response, `Cloudflare Workers AI (${model})`);
-  const result = payload.result as { response?: string } | undefined;
-  const text = result?.response?.trim();
+  const result = (payload.result ?? payload) as {
+    choices?: Array<{ finish_reason?: unknown }>;
+  };
+  const text = extractGeneratedText(payload.result ?? payload);
   if (!text) throw new ProviderError(`Cloudflare Workers AI (${model}) returned no answer`, true);
+  if (result.choices?.[0]?.finish_reason === "length") {
+    if (continuation >= maxResponseContinuations) {
+      throw new ProviderError("The answer exceeded the completion limit after continuation attempts.", false);
+    }
+    return joinContinuation(text, await cloudflareGenerate(
+      continuationMessages(messages, text),
+      model,
+      continuation + 1,
+    ));
+  }
   return text;
 }
 
 async function cloudflareGenerateStream(
   messages: ChatMessage[],
   model: string,
-): Promise<AsyncIterable<string>> {
+): Promise<TextGenerationStream> {
   const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
   const token = requiredEnv("CLOUDFLARE_API_TOKEN");
   const response = await fetch(
@@ -106,7 +146,7 @@ async function cloudflareGenerateStream(
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         messages,
-        max_tokens: 900,
+        max_tokens: responseMaxTokens,
         temperature: 0.15,
         stream: true,
       }),
@@ -123,12 +163,22 @@ async function cloudflareGenerateStream(
     throw new ProviderError(`Cloudflare Workers AI (${model}) returned no stream`, true);
   }
 
-  return parseCloudflareTextStream(response.body, model);
+  let finishReason: string | undefined;
+  const stream = parseCloudflareTextStream(response.body, model, (reason) => {
+    finishReason = reason;
+  });
+  return {
+    [Symbol.asyncIterator]: () => stream,
+    get finishReason() {
+      return finishReason;
+    },
+  };
 }
 
 async function* parseCloudflareTextStream(
   body: ReadableStream<Uint8Array>,
   model: string,
+  onFinishReason: (reason: string) => void,
 ): AsyncGenerator<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -148,12 +198,30 @@ async function* parseCloudflareTextStream(
     }
 
     if (!payload || typeof payload !== "object") return null;
-    const record = payload as { response?: unknown; result?: { response?: unknown } };
+    const record = payload as {
+      response?: unknown;
+      result?: { response?: unknown };
+      choices?: Array<{
+        delta?: { content?: unknown };
+        finish_reason?: unknown;
+      }>;
+    };
+    const resultChoices = (payload as {
+      result?: {
+        choices?: Array<{ delta?: { content?: unknown }; finish_reason?: unknown }>;
+      };
+    }).result?.choices;
+    const choices = record.choices || resultChoices;
+    const finishReason = choices?.[0]?.finish_reason;
+    if (typeof finishReason === "string") onFinishReason(finishReason);
+    const choiceContent = choices?.[0]?.delta?.content;
     const token = typeof record.response === "string"
       ? record.response
       : typeof record.result?.response === "string"
         ? record.result.response
-        : "";
+        : typeof choiceContent === "string"
+          ? choiceContent
+          : "";
     return token || null;
   }
 
@@ -188,6 +256,10 @@ async function* parseCloudflareTextStream(
     );
   } finally {
     reader.releaseLock();
+  }
+
+  if (!receivedText) {
+    throw new ProviderError(`Cloudflare Workers AI (${model}) returned no answer`, true);
   }
 
   if (!receivedText) {
@@ -270,29 +342,133 @@ export async function generateWithFallback(
 
 export async function* generateStreamWithFallback(
   messages: ChatMessage[],
-  primary = (input: ChatMessage[]) => cloudflareGenerateStream(
+  primary: (input: ChatMessage[]) => Promise<AsyncIterable<string>> = (input) => cloudflareGenerateStream(
     input,
     process.env.CF_PRIMARY_TEXT_MODEL || primaryTextModel,
   ),
-  fallback = (input: ChatMessage[]) => cloudflareGenerateStream(
+  fallback: (input: ChatMessage[]) => Promise<AsyncIterable<string>> = (input) => cloudflareGenerateStream(
     input,
     process.env.CF_FALLBACK_TEXT_MODEL || fallbackTextModel,
+  ),
+  fallbackNonStreaming: (input: ChatMessage[]) => Promise<string> = (input) => cloudflareGenerate(
+    input,
+    process.env.CF_FALLBACK_TEXT_MODEL || fallbackTextModel,
+  ),
+  primaryNonStreaming: (input: ChatMessage[]) => Promise<string> = (input) => cloudflareGenerate(
+    input,
+    process.env.CF_PRIMARY_TEXT_MODEL || primaryTextModel,
   ),
 ): AsyncGenerator<{ text: string; provider: "cloudflare-primary" | "cloudflare-fallback" }> {
   let hasEmittedText = false;
   try {
-    const stream = await primary(messages);
-    for await (const text of stream) {
+    for await (const chunk of streamToCompletion(
+      messages,
+      primary,
+      primaryNonStreaming,
+      "cloudflare-primary",
+    )) {
       hasEmittedText = true;
-      yield { text, provider: "cloudflare-primary" };
+      yield chunk;
     }
   } catch (error) {
     const shouldRetry = error instanceof ProviderError ? error.retryable : transientFailure(error);
     if (hasEmittedText || !shouldRetry) throw error;
 
-    const stream = await fallback(messages);
-    for await (const text of stream) {
-      yield { text, provider: "cloudflare-fallback" };
+    let fallbackEmittedText = false;
+    try {
+      for await (const chunk of streamToCompletion(
+        messages,
+        fallback,
+        fallbackNonStreaming,
+        "cloudflare-fallback",
+      )) {
+        fallbackEmittedText = true;
+        yield chunk;
+      }
+    } catch (fallbackError) {
+      const canRetryWithoutStream = fallbackError instanceof ProviderError
+        ? fallbackError.retryable
+        : transientFailure(fallbackError);
+      if (fallbackEmittedText || !canRetryWithoutStream) throw fallbackError;
+
+      console.warn(
+        "Cloudflare streaming fallback produced no usable answer; retrying once without streaming",
+        fallbackError,
+      );
+      const answer = await fallbackNonStreaming(messages);
+      yield { text: answer, provider: "cloudflare-fallback" };
     }
   }
+}
+
+async function* streamToCompletion(
+  messages: ChatMessage[],
+  streamResponse: (input: ChatMessage[]) => Promise<AsyncIterable<string>>,
+  generateResponse: (input: ChatMessage[]) => Promise<string>,
+  provider: "cloudflare-primary" | "cloudflare-fallback",
+): AsyncGenerator<{ text: string; provider: "cloudflare-primary" | "cloudflare-fallback" }> {
+  let answer = "";
+  let continuation = 0;
+
+  while (true) {
+    const requestMessages = continuation === 0
+      ? messages
+      : continuationMessages(messages, answer);
+    let stream: AsyncIterable<string> | undefined;
+
+    try {
+      stream = await streamResponse(requestMessages);
+      for await (const text of stream) {
+        const chunk = answer && text && !/\s$/.test(answer) && /^[\p{L}\p{N}]/u.test(text)
+          ? ` ${text}`
+          : text;
+        answer += chunk;
+        yield { text: chunk, provider };
+      }
+    } catch (error) {
+      if (!answer) throw error;
+
+      console.warn(
+        "Cloudflare answer stream was interrupted after partial text; completing it with a non-streaming request",
+        error,
+      );
+      const completion = await generateResponse(continuationMessages(messages, answer));
+      yield { text: completion, provider };
+      return;
+    }
+
+    const finishReason = (stream as TextGenerationStream).finishReason;
+    if (finishReason !== "length") return;
+
+    if (continuation >= maxResponseContinuations) {
+      throw new ProviderError(
+        "The answer exceeded the completion limit after continuation attempts.",
+        false,
+      );
+    }
+    continuation++;
+  }
+}
+
+function continuationMessages(messages: ChatMessage[], answer: string): ChatMessage[] {
+  return [
+    ...messages,
+    { role: "assistant", content: answer },
+    {
+      role: "user",
+      content: "Continue exactly where the previous answer ended. Do not repeat any earlier text or add a new introduction. Finish the incomplete thought and provide a complete ending, preserving citations and source grounding.",
+    },
+  ];
+}
+
+function joinContinuation(answer: string, continuation: string): string {
+  if (
+    answer &&
+    continuation &&
+    !/\s$/.test(answer) &&
+    /^[\p{L}\p{N}]/u.test(continuation)
+  ) {
+    return `${answer} ${continuation}`;
+  }
+  return answer + continuation;
 }

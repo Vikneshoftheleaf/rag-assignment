@@ -234,6 +234,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #53a187; outli
 }
 .assistant-answer { min-width: 0; max-width: calc(100% - 40px); color: #343a36; }
 .answer-content { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.streaming-answer { white-space: pre-wrap; }
 .record-button {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   border: 1px solid #dce5de; color: #385b48; background: #f8fbf8;

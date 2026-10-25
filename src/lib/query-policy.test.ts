@@ -8,6 +8,11 @@ describe("query scope policy", () => {
     "What revenue and profit were reported for H1 FY2026-27?",
     "What did the auditor conclude?",
     "Summarize these documents.",
+    "Summarize the key information, decisions or figures, actions, and caveats in Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx.",
+    "Summarize the key information, decisions or figures, actions, and caveats in Silverline_Industries_CTC_Board_Resolutions_Register_and_Templates.xlsx.",
+    "Summarize the key information, decisions or figures, actions, and caveats in Silverline_Industries_Board_Meeting_Minutes_22_October_2026.docx.",
+    "Summarize the key information, decisions or figures, actions, and caveats in Silverline_Industries_Auditors_Limited_Review_Report_Q2_H1_FY2026-27.pdf.",
+    "Summarize the key information, decisions or figures, actions, and caveats in Illustrative_Board_Meeting_Outcome_Silverline_Industries_Limited.pdf.",
     "What does the resolutions register say?",
   ])("allows a Silverline corpus question: %s", (message) => {
     expect(applyQueryPolicy(message)).toEqual({ allowed: true });

@@ -210,6 +210,72 @@ def _infer_scope(*labels: str) -> str | None:
     return None
 
 
+def _financial_period(header: str, filename_period: str | None, filename_fiscal_year: str | None) -> str | None:
+    normalized_header = re.sub(r"\s+", " ", header).strip()
+    explicit = re.search(
+        r"\b(Q[1-4]|H[1-2])(?:\s+FY\s*(\d{4}(?:[-–/]\d{2,4})?|\d{2}))?\b",
+        normalized_header,
+        re.I,
+    )
+    if explicit:
+        period = explicit.group(1).upper()
+        fiscal_year = explicit.group(2)
+        if fiscal_year:
+            return f"{period} FY{fiscal_year.replace('–', '-').replace('/', '-')}"
+        if filename_fiscal_year:
+            return f"{period} FY{filename_fiscal_year}"
+        return period
+
+    header_kind = re.search(r"\b(quarter|half[\s-]*year)\b", normalized_header, re.I)
+    date = re.search(
+        r"\b\d{1,2}[-\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-\s](\d{4})\b",
+        normalized_header,
+        re.I,
+    )
+    period = filename_period.upper() if filename_period else None
+    fiscal_year = filename_fiscal_year
+    if date:
+        month = date.group(1).lower()
+        calendar_year = int(date.group(2))
+        fiscal_start = calendar_year if month in {
+            "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        } else calendar_year - 1
+        fiscal_year = f"{fiscal_start}-{str(fiscal_start + 1)[-2:]}"
+    if header_kind:
+        period = "H1" if header_kind.group(1).lower().startswith("half") else period
+    if period and fiscal_year:
+        return f"{period} FY{fiscal_year}"
+    return period
+
+
+def _financial_unit(header: str, metric: str, sheet_context: str) -> str | None:
+    measure = f"{header} {metric}"
+    normalized_measure = measure.lower()
+    context = f"{header} {sheet_context}"
+    normalized_context = context.lower()
+
+    currency = "₹" if "₹" in context or re.search(r"\b(?:inr|rs\.?)\b", normalized_context) else (
+        "USD" if "$" in context or re.search(r"\busd\b", normalized_context) else ""
+    )
+    scale_match = re.search(
+        r"\b(crore|lakh|million|billion|thousand)\b",
+        normalized_measure,
+    ) or re.search(r"\b(crore|lakh|million|billion|thousand)\b", normalized_context)
+    if "per share" in normalized_measure or re.search(r"\beps\b", normalized_measure):
+        return f"{currency} per share".strip() if currency else "per share"
+    if "%" in measure or re.search(r"\bpercent(?:age)?\b", normalized_measure):
+        return "%"
+    if "shares" in normalized_measure and scale_match:
+        return f"{scale_match.group(1)} shares"
+    if scale_match:
+        return f"{currency} {scale_match.group(1)}".strip()
+    if currency:
+        return currency
+    if re.search(r"\btimes\b|\bx\b", normalized_measure):
+        return "times"
+    return None
+
+
 def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     """Read populated workbook cells; formulas with blank cached results are warnings, not zeroes."""
     from openpyxl import load_workbook
@@ -218,11 +284,23 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     formula_book = load_workbook(path, read_only=True, data_only=False)
     facts: list[dict[str, Any]] = []
     warnings: list[str] = []
-    filename_period = re.search(r"(Q[1-4]|H[12]|FY\d{4}[-–]\d{2,4})", path.stem, re.I)
+    filename_period = re.search(r"(?<![A-Za-z0-9])(Q[1-4]|H[1-2])(?![A-Za-z0-9])", path.stem, re.I)
+    filename_fiscal_year = re.search(r"(?<![A-Za-z0-9])FY\s*(\d{4}[-–/]\d{2,4})\b", path.stem, re.I)
     filename_period_text = filename_period.group(1) if filename_period else None
+    filename_fiscal_year_text = (
+        filename_fiscal_year.group(1).replace("–", "-").replace("/", "-")
+        if filename_fiscal_year
+        else None
+    )
     try:
         for values_sheet in value_book.worksheets:
             formulas_sheet = formula_book[values_sheet.title]
+            sheet_context = " ".join(
+                str(cell.value).strip()
+                for row in values_sheet.iter_rows(min_row=1, max_row=min(5, values_sheet.max_row))
+                for cell in row
+                if cell.value is not None and not isinstance(cell.value, (int, float, bool))
+            )
             for formula_row in formulas_sheet.iter_rows():
                 for formula_cell in formula_row:
                     if not (
@@ -254,10 +332,8 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
                     if number is None:
                         continue
                     header = headers.get(cell.column, "")
-                    period_match = re.search(r"(Q[1-4]|H[12]|FY\d{4}[-–]\d{2,4}|20\d{2}(?:[-/]\d{2,4})?)", header, re.I)
-                    period = period_match.group(1) if period_match else filename_period_text
-                    unit_match = re.search(r"(₹|INR|Rs\.?|USD|%|crore|lakh|million|billion)", header + " " + metric, re.I)
-                    unit = unit_match.group(1) if unit_match else None
+                    period = _financial_period(header, filename_period_text, filename_fiscal_year_text)
+                    unit = _financial_unit(header, metric, sheet_context)
                     value_text = str(cell.value).strip()
                     facts.append({
                         "metric": f"{metric} — {header}" if header else metric,

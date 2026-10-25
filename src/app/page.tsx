@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { markdownWithCitationLinks } from "@/lib/markdown";
 import {
   ArrowDown,
   ArrowUp,
@@ -81,13 +82,6 @@ function formatLocation(location: Record<string, unknown>): string {
     .filter((key) => location[key] !== undefined && location[key] !== null && `${location[key]}`.trim())
     .map((key) => `${key}: ${location[key]}`);
   return parts.join(" · ") || "Source excerpt";
-}
-
-function markdownWithCitationLinks(markdown: string): string {
-  const segments = markdown.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g);
-  return segments.map((segment, index) => index % 2 === 0
-    ? segment.replace(/\[(S\d+)\](?!\()/g, "[$1](#citation-$1)")
-    : segment).join("");
 }
 
 function MarkdownAnswer({ turn, onOpenSources }: {
@@ -199,7 +193,7 @@ export default function Home() {
     }
   }, []);
 
-  async function ask(value: string) {
+  async function ask(value: string, documentId?: string) {
     const message = value.trim();
     if (!message || loading) return;
     setActiveView("chat");
@@ -219,7 +213,7 @@ export default function Home() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, ...(documentId ? { documentId } : {}) }),
       });
       if (!response.ok) {
         const payload = await response.json() as { error?: string };
@@ -530,14 +524,19 @@ export default function Home() {
                           <div className={`assistant-answer ${turn.abstained ? "abstained" : ""}`}>
                             <div className="answer-content">
                               {turn.abstained && <div className="abstain-tag">NOT FOUND IN SAMPLE SOURCES</div>}
-                              <MarkdownAnswer
-                                turn={turn}
-                                onOpenSources={(sources) => {
-                                  setActiveSources(sources);
-                                  setSourceView("answer");
-                                  setSourcesOpen(true);
-                                }}
-                              />
+                              {turn.pending ? (
+                                <div className="streaming-answer">{turn.answer}</div>
+                              ) : (
+                                <MarkdownAnswer
+                                  key={`completed-${turn.id}`}
+                                  turn={turn}
+                                  onOpenSources={(sources) => {
+                                    setActiveSources(sources);
+                                    setSourceView("answer");
+                                    setSourcesOpen(true);
+                                  }}
+                                />
+                              )}
                             </div>
                             {turn.pending && <div className="loading-row stream-indicator"><LoaderCircle className="spinner" size={15} /><span>{turn.status || "Writing answer…"}</span></div>}
                             {turn.error && <div className="stream-error" role="alert">{turn.error}</div>}
@@ -627,7 +626,10 @@ export default function Home() {
                         type="button"
                         aria-label={`Ask about ${document.filename}`}
                         title={`Ask about ${document.filename}`}
-                        onClick={() => void ask(`Summarize the key information in ${document.filename}.`)}
+                        onClick={() => void ask(
+                          `Summarize the key information, decisions or figures, actions, and caveats in ${document.filename}.`,
+                          document.id,
+                        )}
                       >
                         <MessageSquareText size={16} />
                       </button>

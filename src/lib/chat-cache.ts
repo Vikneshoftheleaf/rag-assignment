@@ -30,13 +30,14 @@ export function buildQuestionKey(question: string): string {
 export function buildCacheConfigurationHash(): string {
   return sha256(JSON.stringify({
     cacheConfigurationVersion,
-    promptVersion: "grounded-prompt-v1",
-    retrievalVersion: "hybrid-search-v1",
+    promptVersion: "grounded-prompt-v5",
+    retrievalVersion: "hybrid-search-v4",
+    responseMaxTokens: 1600,
     minimumRelevance: process.env.RETRIEVAL_MIN_SCORE || "0.18",
     embeddingModel: process.env.CF_EMBEDDING_MODEL || "@cf/baai/bge-base-en-v1.5",
     embeddingDimensions: process.env.CF_EMBEDDING_DIMENSIONS || "768",
-    primaryModel: process.env.CF_PRIMARY_TEXT_MODEL || "@cf/qwen/qwen3-30b-a3b-fp8",
-    fallbackModel: process.env.CF_FALLBACK_TEXT_MODEL || "@cf/meta/llama-3.2-3b-instruct",
+    primaryModel: process.env.CF_PRIMARY_TEXT_MODEL || "@cf/openai/gpt-oss-120b",
+    fallbackModel: process.env.CF_FALLBACK_TEXT_MODEL || "@cf/openai/gpt-oss-20b",
   }));
 }
 
