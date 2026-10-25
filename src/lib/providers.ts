@@ -1,6 +1,8 @@
 const timeout = 12_000;
 const primaryTextModel = "@cf/qwen/qwen3-30b-a3b-fp8";
 const fallbackTextModel = "@cf/meta/llama-3.2-3b-instruct";
+const primaryTranscriptionModel = "@cf/openai/whisper-large-v3-turbo";
+const fallbackTranscriptionModel = "@cf/openai/whisper";
 
 export type ChatMessage = { role: "system" | "user"; content: string };
 
@@ -28,7 +30,11 @@ async function readJson(response: Response, provider: string): Promise<Record<st
       response.status === 429 || response.status >= 500,
     );
   }
-  return (await response.json()) as Record<string, unknown>;
+  try {
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    throw new ProviderError(`${provider} returned invalid JSON`, true);
+  }
 }
 
 export async function embedText(text: string): Promise<number[]> {
@@ -87,6 +93,59 @@ async function cloudflareGenerate(messages: ChatMessage[], model: string): Promi
   return text;
 }
 
+async function cloudflareTranscriptionRequest(model: string, body: unknown): Promise<Response> {
+  const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
+  const token = requiredEnv("CLOUDFLARE_API_TOKEN");
+  return fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/${modelPath(model)}`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout),
+    },
+  );
+}
+
+function transientFailure(error: unknown): boolean {
+  return error instanceof TypeError ||
+    (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError"));
+}
+
+export async function transcribeWithFallback(
+  audio: Uint8Array,
+  primary = async (input: Uint8Array) => {
+    const response = await cloudflareTranscriptionRequest(
+      process.env.CF_PRIMARY_STT_MODEL || primaryTranscriptionModel,
+      { audio: Buffer.from(input).toString("base64"), task: "transcribe", vad_filter: true },
+    );
+    const payload = await readJson(response, "Cloudflare Workers AI transcription");
+    const result = payload.result as { text?: unknown } | undefined;
+    const text = typeof result?.text === "string" ? result.text.trim() : "";
+    if (!text) throw new ProviderError("Cloudflare transcription returned no text", true);
+    return text;
+  },
+  fallback = async (input: Uint8Array) => {
+    const response = await cloudflareTranscriptionRequest(
+      process.env.CF_FALLBACK_STT_MODEL || fallbackTranscriptionModel,
+      { audio: Array.from(input) },
+    );
+    const payload = await readJson(response, "Cloudflare Workers AI fallback transcription");
+    const result = payload.result as { text?: unknown } | undefined;
+    const text = typeof result?.text === "string" ? result.text.trim() : "";
+    if (!text) throw new ProviderError("Cloudflare fallback transcription returned no text", true);
+    return text;
+  },
+): Promise<{ text: string; provider: "cloudflare-primary" | "cloudflare-fallback" }> {
+  try {
+    return { text: await primary(audio), provider: "cloudflare-primary" };
+  } catch (error) {
+    const shouldRetry = error instanceof ProviderError ? error.retryable : transientFailure(error);
+    if (!shouldRetry) throw error;
+    return { text: await fallback(audio), provider: "cloudflare-fallback" };
+  }
+}
+
 export async function generateWithFallback(
   messages: ChatMessage[],
   primary = (input: ChatMessage[]) => cloudflareGenerate(
@@ -101,10 +160,8 @@ export async function generateWithFallback(
   try {
     return { text: await primary(messages), provider: "cloudflare-primary" };
   } catch (error) {
-    const transientNetworkFailure =
-      error instanceof TypeError ||
-      (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError"));
-    if (!(error instanceof ProviderError ? error.retryable : transientNetworkFailure)) throw error;
+    const shouldRetry = error instanceof ProviderError ? error.retryable : transientFailure(error);
+    if (!shouldRetry) throw error;
     return { text: await fallback(messages), provider: "cloudflare-fallback" };
   }
 }

@@ -4,8 +4,8 @@ This repository implements the approved public chat MVP for the **illustrative S
 
 ## Architecture
 
-- `src/app/`: Next.js App Router chat UI and `/api/chat` Route Handler (no separate API service).
-- `src/lib/`: Cloudflare Workers AI embeddings, Supabase hybrid retrieval, and two Cloudflare-hosted Workers AI text models with transient-failure fallback.
+- `src/app/`: Next.js App Router chat UI, `/api/chat`, and a Cloudflare Workers AI transcription Route Handler (no separate API service).
+- `src/lib/`: Cloudflare Workers AI embeddings, transcription and text models, Supabase hybrid retrieval, and provider fallback.
 - `supabase/migrations/`: Postgres schema, pgvector/full-text indexes, atomic idempotent document replacement, hybrid chunk/fact search, and the server-side chat response cache.
 - `ingestion/`: Python Docling indexing CLI; spreadsheet facts additionally retain sheet/row/cell coordinates.
 - `docs/`: the supplied local sample corpus. Files are not sent anywhere by this project until you explicitly run the ingestion CLI.
@@ -34,7 +34,13 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` in `.env.local`. Optional model settings are `CF_EMBEDDING_MODEL`, `CF_EMBEDDING_DIMENSIONS`, `CF_PRIMARY_TEXT_MODEL` (default `@cf/qwen/qwen3-30b-a3b-fp8`), `CF_FALLBACK_TEXT_MODEL` (default `@cf/meta/llama-3.2-3b-instruct`), and `RETRIEVAL_MIN_SCORE`. These are Cloudflare-hosted models accessed through Workers AI; you do not need to run model servers yourself. Open the URL printed by Next.js (normally `http://localhost:3000`).
+Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` in `.env.local`. Model settings and defaults are listed in `.env.example`. Speech recognition uses Cloudflare Workers AI Whisper Large v3 Turbo with Whisper as a transient-failure fallback. These are Cloudflare-hosted models accessed through Workers AI; you do not need to run model servers yourself. Open the URL printed by Next.js (normally `http://localhost:3000`).
+
+### Voice features
+
+- Use the microphone control in the composer to record a question. The browser requests microphone permission, applies supported noise/echo cancellation, and stops automatically after 60 seconds. The transcript is inserted into the editable question field; it is not sent until you press Send.
+- Recordings are limited to 2 MB and supported browser formats (WebM, Ogg, MP4, WAV, or AAC). Transcription is handled server-side, so Cloudflare credentials are never exposed to the browser.
+- `POST /api/speech/transcribe` accepts multipart form data with an `audio` file and returns `{ transcript, provider }`.
 
 `POST /api/chat` accepts `{ "message": "..." }` (1–2000 characters) and returns `{ answer, citations, abstained, provider? }`. The route checks the Supabase response cache first; on a miss, it embeds the question, calls the `hybrid_search` database function, abstains if no results meet the configured relevance threshold, then calls the primary Cloudflare Workers AI model. It uses the fallback Cloudflare model only if the primary fails transiently (HTTP 429/5xx, network failure, or timeout). Successful answers are cached for 24 hours by default; `CHAT_CACHE_TTL_SECONDS` changes the TTL. Cache keys include a normalized question, a revision derived from indexed document checksums and names, and the retrieval/model configuration. Consequently, document re-indexing that changes corpus content or a model/prompt configuration change naturally causes a cache miss. Cache read/write failures are logged and do not prevent a fresh answer. Cloudflare Workers AI has a daily free allocation; usage above the allowance may require a paid Workers plan. Check the current [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) for details.
 
@@ -72,11 +78,11 @@ The repository deploys as a single Next.js app. `vercel.json` selects the Next.j
    - `SUPABASE_SERVICE_ROLE_KEY`
    - `CLOUDFLARE_ACCOUNT_ID`
    - `CLOUDFLARE_API_TOKEN`
-7. Optionally set the model/cache overrides from `.env.example`: `CF_EMBEDDING_MODEL`, `CF_EMBEDDING_DIMENSIONS`, `CF_PRIMARY_TEXT_MODEL`, `CF_FALLBACK_TEXT_MODEL`, `RETRIEVAL_MIN_SCORE`, and `CHAT_CACHE_TTL_SECONDS`. Defaults are listed there. Never add a `NEXT_PUBLIC_` prefix to secrets.
+7. Optionally set model/cache overrides, including speech model IDs, from `.env.example`. Never add a `NEXT_PUBLIC_` prefix to secrets.
 8. Deploy. Redeploy after changing Vercel environment variables.
 9. Smoke-test the deployment: open `/`, then `/api/documents` and confirm the indexed files are listed. Ask a question whose answer exists in the sample corpus and confirm the response includes citations.
 
-The chat and document API routes explicitly use the Node.js runtime. Chat requests have a 30-second maximum duration. Vercel cannot apply database migrations or ingest local files as part of the Next.js build. The service-role key and Cloudflare token must stay server-side. A Vercel deployment does not automatically create Supabase/Cloudflare accounts, configure secrets, or populate the index.
+The chat, document, and transcription API routes explicitly use the Node.js runtime. AI routes have a 30-second maximum duration. Vercel cannot apply database migrations or ingest local files as part of the Next.js build. The service-role key and Cloudflare token must stay server-side. A Vercel deployment does not automatically create Supabase/Cloudflare accounts, configure secrets, or populate the index.
 
 ## Checks
 

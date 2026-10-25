@@ -11,10 +11,12 @@ import {
   FileSpreadsheet,
   FileText,
   LoaderCircle,
+  Mic,
   MessageSquareText,
   PanelRightClose,
   RefreshCw,
   Sparkles,
+  Square,
   TriangleAlert,
 } from "lucide-react";
 import type { ChatResponse, Citation, IndexedDocument } from "@/lib/types";
@@ -128,8 +130,17 @@ export default function Home() {
   const [activeView, setActiveView] = useState<"chat" | "faq">("chat");
   const [sourcesOpen, setSourcesOpen] = useState(true);
   const [noticeOpen, setNoticeOpen] = useState(true);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recordingFailedRef = useRef(false);
+  const transcriptionControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -137,6 +148,26 @@ export default function Home() {
       conversation.scrollTop = conversation.scrollHeight;
     }
   }, [turns, loading]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 160)}px`;
+  }, [question]);
+
+  useEffect(() => () => {
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onerror = null;
+      recorder.onstop = null;
+      if (recorder.state !== "inactive") recorder.stop();
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    transcriptionControllerRef.current?.abort();
+  }, []);
 
   const loadDocuments = useCallback(async () => {
     setDocumentsLoading(true);
@@ -208,12 +239,135 @@ export default function Home() {
   }
 
   function startFresh() {
+    discardVoiceWork();
+    setVoiceError("");
     setTurns([]);
     setActiveSources([]);
     setSourceView("documents");
     setActiveView("chat");
     setQuestion("");
     textareaRef.current?.focus();
+  }
+
+  function stopRecordingResources() {
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    recordingTimeoutRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    recorderRef.current = null;
+    setRecording(false);
+  }
+
+  function discardVoiceWork() {
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    recordingTimeoutRef.current = null;
+    const recorder = recorderRef.current;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onerror = null;
+      recorder.onstop = null;
+      if (recorder.state !== "inactive") recorder.stop();
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    recorderRef.current = null;
+    recordingChunksRef.current = [];
+    transcriptionControllerRef.current?.abort();
+    transcriptionControllerRef.current = null;
+    setRecording(false);
+    setTranscribing(false);
+  }
+
+  async function transcribeRecording(blob: Blob) {
+    if (!blob.size) {
+      setVoiceError("No audio was captured. Please try recording again.");
+      return;
+    }
+    if (blob.size > 2 * 1024 * 1024) {
+      setVoiceError("Recording is too large. Try a shorter recording.");
+      return;
+    }
+
+    setTranscribing(true);
+    setVoiceError("");
+    const controller = new AbortController();
+    transcriptionControllerRef.current = controller;
+    try {
+      const extension = blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : "webm";
+      const form = new FormData();
+      form.append("audio", blob, `question.${extension}`);
+      const response = await fetch("/api/speech/transcribe", {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      });
+      const payload = await response.json() as { transcript?: string; error?: string };
+      if (!response.ok) throw new Error(payload.error || "Could not transcribe the recording.");
+      const transcript = payload.transcript?.trim();
+      if (!transcript) throw new Error("No speech was detected. Please try again or type your question.");
+      setQuestion((current) => [current.trim(), transcript].filter(Boolean).join(" "));
+      textareaRef.current?.focus();
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setVoiceError(error instanceof Error ? error.message : "Could not transcribe the recording.");
+    } finally {
+      if (transcriptionControllerRef.current === controller) transcriptionControllerRef.current = null;
+      setTranscribing(false);
+    }
+  }
+
+  async function startRecording() {
+    setVoiceError("");
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setVoiceError("Audio recording is not supported by this browser.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      streamRef.current = stream;
+      const mimeType = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"]
+        .find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      recordingChunksRef.current = [];
+      recordingFailedRef.current = false;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        recordingFailedRef.current = true;
+        setVoiceError("Recording failed. Check microphone access and try again.");
+        if (recorder.state !== "inactive") recorder.stop();
+      };
+      recorder.onstop = () => {
+        const failed = recordingFailedRef.current;
+        const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        recordingChunksRef.current = [];
+        stopRecordingResources();
+        if (!failed) void transcribeRecording(blob);
+      };
+      recorder.start(250);
+      setRecording(true);
+      recordingTimeoutRef.current = setTimeout(() => {
+        if (recorder.state === "recording") recorder.stop();
+      }, 60_000);
+    } catch (error) {
+      stopRecordingResources();
+      setVoiceError(error instanceof DOMException && error.name === "NotAllowedError"
+        ? "Microphone access was denied. Allow microphone access or type your question."
+        : "Could not start recording. Check your microphone and try again.");
+    }
+  }
+
+  function toggleRecording() {
+    if (recording) {
+      if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+      return;
+    }
+    if (!transcribing && !loading) void startRecording();
   }
 
   function updateQuestion(value: string) {
@@ -323,8 +477,25 @@ export default function Home() {
                 onChange={(event) => updateQuestion(event.target.value)}
                 onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(question); } }}
               />
+              {recording && <div className="voice-status recording-status" role="status"><span className="recording-dot" /> Recording · tap the microphone to finish (60 sec max)</div>}
+              {transcribing && <div className="voice-status" role="status"><LoaderCircle className="spinner" size={14} /> Transcribing your question…</div>}
+              {voiceError && <div className="voice-status voice-error" role="alert"><TriangleAlert size={14} /> {voiceError}</div>}
               <div className="composer-footer"><span>Use Shift + Enter for a new line</span>
-                <button aria-label="Send question" className="send-button" disabled={!question.trim() || loading}><ArrowUp size={18} /></button></div>
+                <div className="composer-actions">
+                  <button
+                    aria-label={recording ? "Stop recording and transcribe" : "Record a question"}
+                    title={recording ? "Stop recording" : "Record a question"}
+                    className={`record-button ${recording ? "is-recording" : ""}`}
+                    type="button"
+                    disabled={loading || transcribing}
+                    onClick={toggleRecording}
+                  >
+                    {recording ? <Square size={15} /> : transcribing ? <LoaderCircle className="spinner" size={16} /> : <Mic size={17} />}
+                    <span>{recording ? "Stop" : transcribing ? "Transcribing" : "Voice"}</span>
+                  </button>
+                  <button aria-label="Send question" className="send-button" disabled={!question.trim() || loading || transcribing}><ArrowUp size={18} /></button>
+                </div>
+              </div>
             </form>
             <p className="disclaimer">AI can make mistakes. Verify important details in the cited sources.</p>
           </div>
@@ -360,10 +531,20 @@ export default function Home() {
                   <p className="source-intro">Indexed files available to the assistant</p>
                   {documents.map((document) => (
                     <article className="source-card library-card" key={document.id}>
-                      <div className="source-card-top"><span className="source-label">{document.documentType.toUpperCase()}</span><span className="file-type-icon"><FileGlyph type={document.documentType} /></span></div>
-                      <h3>{document.filename}</h3>
-                      <span className="source-location">{document.chunkCount} passages · {document.factCount} facts</span>
-                      <button className="text-action ask-document" onClick={() => void ask(`Summarize the key information in ${document.filename}.`)}>Ask about this file <ArrowDown size={13} /></button>
+                      <span className="file-type-icon"><FileGlyph type={document.documentType} /></span>
+                      <div className="library-card-details">
+                        <h3>{document.filename}</h3>
+                        <span className="source-location">{document.chunkCount} passages · {document.factCount} facts</span>
+                      </div>
+                      <button
+                        className="ask-document"
+                        type="button"
+                        aria-label={`Ask about ${document.filename}`}
+                        title={`Ask about ${document.filename}`}
+                        onClick={() => void ask(`Summarize the key information in ${document.filename}.`)}
+                      >
+                        <MessageSquareText size={16} />
+                      </button>
                     </article>
                   ))}
                 </>
