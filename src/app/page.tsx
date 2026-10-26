@@ -1,27 +1,44 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import type { User } from "@supabase/supabase-js";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { markdownWithCitationLinks } from "@/lib/markdown";
+import { AuthScreen } from "@/app/auth-screen";
+import { authenticatedFetch, getBrowserSupabase } from "@/lib/supabase-browser";
 import {
   ArrowDown,
   ArrowUp,
   BookOpenText,
+  Check,
+  Copy,
   ChevronDown,
+  Clock3,
   FileSpreadsheet,
   FileText,
+  LogOut,
   LoaderCircle,
   Mic,
   MessageSquareText,
+  PanelLeft,
+  Pencil,
   PanelRightClose,
   RefreshCw,
   Sparkles,
   Square,
   TriangleAlert,
+  Trash2,
   UserRound,
 } from "lucide-react";
 import type { ChatResponse, Citation, IndexedDocument } from "@/lib/types";
+
+type ChatSession = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+};
 
 type ChatTurn = {
   id: string;
@@ -29,6 +46,7 @@ type ChatTurn = {
   answer: string;
   citations: Citation[];
   abstained: boolean;
+  documentId?: string;
   pending?: boolean;
   status?: string;
   error?: string;
@@ -118,8 +136,17 @@ function MarkdownAnswer({ turn, onOpenSources }: {
 }
 
 export default function Home() {
+  const supabase = getBrowserSupabase();
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
   const [loading, setLoading] = useState(false);
   const [activeSources, setActiveSources] = useState<Citation[]>([]);
   const [documents, setDocuments] = useState<IndexedDocument[]>([]);
@@ -128,18 +155,48 @@ export default function Home() {
   const [sourceView, setSourceView] = useState<"documents" | "answer">("documents");
   const [activeView, setActiveView] = useState<"chat" | "faq">("chat");
   const [sourcesOpen, setSourcesOpen] = useState(true);
+  const [copyFeedback, setCopyFeedback] = useState<{ turnId: string; message: string } | null>(null);
   const [noticeOpen, setNoticeOpen] = useState(true);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const conversationRef = useRef<HTMLDivElement>(null);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordingFailedRef = useRef(false);
   const transcriptionControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!supabase) {
+      setAuthReady(true);
+      return;
+    }
+
+    let mounted = true;
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted) return;
+      if (error) console.error("Could not restore authentication session", error);
+      setUser(data.session?.user ?? null);
+      setAuthReady(true);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      if (!session) {
+        setTurns([]);
+        setSessions([]);
+        setActiveSessionId(null);
+        setActiveSources([]);
+      }
+    });
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, [supabase]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -169,10 +226,11 @@ export default function Home() {
   }, []);
 
   const loadDocuments = useCallback(async () => {
+    if (!supabase || !user) return;
     setDocumentsLoading(true);
     setDocumentsError("");
     try {
-      const response = await fetch("/api/documents", { cache: "no-store" });
+      const response = await authenticatedFetch(supabase, "/api/documents", { cache: "no-store" });
       const payload = await response.json() as { documents?: IndexedDocument[]; error?: string };
       if (!response.ok) throw new Error(payload.error || "Could not load indexed documents.");
       setDocuments(payload.documents || []);
@@ -181,11 +239,31 @@ export default function Home() {
     } finally {
       setDocumentsLoading(false);
     }
-  }, []);
+  }, [supabase, user]);
 
   useEffect(() => {
-    void loadDocuments();
-  }, [loadDocuments]);
+    if (user) void loadDocuments();
+  }, [loadDocuments, user]);
+
+  const loadSessions = useCallback(async () => {
+    if (!supabase || !user) return;
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      const response = await authenticatedFetch(supabase, "/api/conversations", { cache: "no-store" });
+      const payload = await response.json() as { sessions?: ChatSession[]; error?: string };
+      if (!response.ok) throw new Error(payload.error || "Could not load chat history.");
+      setSessions(payload.sessions || []);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not load chat history.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [supabase, user]);
+
+  useEffect(() => {
+    if (user) void loadSessions();
+  }, [loadSessions, user]);
 
   useEffect(() => {
     if (window.matchMedia("(max-width: 760px)").matches) {
@@ -193,24 +271,64 @@ export default function Home() {
     }
   }, []);
 
-  async function ask(value: string, documentId?: string) {
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAccountMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [accountMenuOpen]);
+
+  async function ask(value: string, documentId?: string, replaceTurnId?: string) {
     const message = value.trim();
-    if (!message || loading) return;
+    if (!message || loading || !supabase || !user) return;
     setActiveView("chat");
-    const turnId = crypto.randomUUID();
-    setQuestion("");
+    const turnId = replaceTurnId || crypto.randomUUID();
+    if (!replaceTurnId) setQuestion("");
     setLoading(true);
-    setTurns((existing) => [...existing, {
-      id: turnId,
-      question: message,
-      answer: "",
-      citations: [],
-      abstained: false,
-      pending: true,
-    }]);
+    setTurns((existing) => replaceTurnId
+      ? existing.map((turn) => turn.id === replaceTurnId
+        ? {
+          ...turn,
+          answer: "",
+          citations: [],
+          abstained: false,
+          pending: true,
+          status: undefined,
+          error: undefined,
+        }
+        : turn)
+      : [...existing, {
+        id: turnId,
+        question: message,
+        answer: "",
+        citations: [],
+        abstained: false,
+        documentId,
+        pending: true,
+      }]);
     setSourceView("answer");
     try {
-      const response = await fetch("/api/chat", {
+      let sessionId = activeSessionId;
+      const turnToSave = {
+        id: turnId,
+        question: message,
+        answer: "",
+        citations: [] as Citation[],
+        abstained: false,
+        documentId,
+      };
+
+      const response = await authenticatedFetch(supabase, "/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
         body: JSON.stringify({ message, ...(documentId ? { documentId } : {}) }),
@@ -223,6 +341,9 @@ export default function Home() {
       if (response.headers.get("content-type")?.includes("application/json")) {
         const payload = await response.json() as ChatResponse;
         const citations = payload.citations || [];
+        turnToSave.answer = payload.answer;
+        turnToSave.citations = citations;
+        turnToSave.abstained = payload.abstained;
         setTurns((existing) => existing.map((turn) => turn.id === turnId
           ? { ...turn, answer: payload.answer, citations, abstained: payload.abstained, pending: false }
           : turn));
@@ -260,6 +381,9 @@ export default function Home() {
           } else if (event === "final") {
             receivedFinal = true;
             const citations = payload.citations || [];
+            turnToSave.answer = payload.answer;
+            turnToSave.citations = citations;
+            turnToSave.abstained = payload.abstained;
             setTurns((existing) => existing.map((turn) => turn.id === turnId
               ? {
                 ...turn,
@@ -287,6 +411,33 @@ export default function Home() {
         if (buffer.trim()) handleEvent(buffer);
         if (!receivedFinal) throw new Error("The assistant response ended unexpectedly.");
       }
+      if (!sessionId) {
+        const createResponse = await authenticatedFetch(supabase, "/api/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: message.slice(0, 120) }),
+        });
+        const createPayload = await createResponse.json() as { session?: ChatSession; error?: string };
+        if (!createResponse.ok || !createPayload.session) {
+          throw new Error(createPayload.error || "Could not create a chat session.");
+        }
+        sessionId = createPayload.session.id;
+        setActiveSessionId(sessionId);
+        setSessions((existing) => [createPayload.session!, ...existing]);
+      }
+      const persistResponse = await authenticatedFetch(supabase, "/api/conversations", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "turn", sessionId, turn: turnToSave }),
+      });
+      const persistPayload = await persistResponse.json() as { error?: string };
+      if (!persistResponse.ok) throw new Error(persistPayload.error || "Answer received but could not be saved to chat history.");
+      setSessions((existing) => {
+        const updated = existing.map((session) => session.id === sessionId
+          ? { ...session, updated_at: new Date().toISOString() }
+          : session);
+        return updated.sort((first, second) => second.updated_at.localeCompare(first.updated_at));
+      });
     } catch (error) {
       setTurns((existing) => existing.map((turn) => turn.id === turnId
         ? { ...turn, pending: false, status: undefined, error: error instanceof Error ? error.message : "Could not reach the assistant." }
@@ -295,6 +446,108 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function copyAnswer(turn: ChatTurn) {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is not available in this browser.");
+      }
+      await navigator.clipboard.writeText(turn.answer);
+      setCopyFeedback({ turnId: turn.id, message: "Answer copied." });
+    } catch {
+      setCopyFeedback({
+        turnId: turn.id,
+        message: "Could not copy the answer. Check clipboard permissions or select the text to copy it.",
+      });
+    }
+  }
+
+  async function openSession(sessionId: string) {
+    if (!supabase || !user || loading) return;
+    setHistoryError("");
+    setHistoryLoading(true);
+    try {
+      const response = await authenticatedFetch(
+        supabase,
+        `/api/conversations?id=${encodeURIComponent(sessionId)}`,
+        { cache: "no-store" },
+      );
+      const payload = await response.json() as {
+        session?: ChatSession;
+        turns?: Array<{
+          id: string;
+          question: string;
+          answer: string;
+          citations: Citation[];
+          abstained: boolean;
+          document_id: string | null;
+        }>;
+        error?: string;
+      };
+      if (!response.ok || !payload.session) throw new Error(payload.error || "Could not open this chat.");
+      setActiveSessionId(payload.session.id);
+      setTurns((payload.turns || []).map((turn) => ({
+        id: turn.id,
+        question: turn.question,
+        answer: turn.answer,
+        citations: turn.citations || [],
+        abstained: turn.abstained,
+        documentId: turn.document_id || undefined,
+      })));
+      const latestCitations = payload.turns?.at(-1)?.citations || [];
+      setActiveSources(latestCitations);
+      setSourceView("answer");
+      setActiveView("chat");
+      setHistoryOpen(false);
+      setQuestion("");
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not open this chat.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function renameSession(session: ChatSession) {
+    if (!supabase) return;
+    const title = window.prompt("Rename this chat", session.title)?.trim();
+    if (!title || title === session.title) return;
+    try {
+      const response = await authenticatedFetch(supabase, "/api/conversations", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "rename", sessionId: session.id, title }),
+      });
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error || "Could not rename this chat.");
+      setSessions((existing) => existing.map((item) => item.id === session.id ? { ...item, title } : item));
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not rename this chat.");
+    }
+  }
+
+  async function deleteSession(session: ChatSession) {
+    if (!supabase || !window.confirm(`Delete "${session.title}" and its messages? This cannot be undone.`)) return;
+    try {
+      const response = await authenticatedFetch(
+        supabase,
+        `/api/conversations?id=${encodeURIComponent(session.id)}`,
+        { method: "DELETE" },
+      );
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(payload.error || "Could not delete this chat.");
+      setSessions((existing) => existing.filter((item) => item.id !== session.id));
+      if (activeSessionId === session.id) startFresh();
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not delete this chat.");
+    }
+  }
+
+  async function signOut() {
+    if (!supabase) return;
+    discardVoiceWork();
+    const { error } = await supabase.auth.signOut();
+    if (error) setHistoryError(`Could not sign out: ${error.message}`);
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -306,9 +559,11 @@ export default function Home() {
     discardVoiceWork();
     setVoiceError("");
     setTurns([]);
+    setActiveSessionId(null);
     setActiveSources([]);
     setSourceView("documents");
     setActiveView("chat");
+    setHistoryOpen(false);
     setQuestion("");
     textareaRef.current?.focus();
   }
@@ -360,7 +615,8 @@ export default function Home() {
       const extension = blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : "webm";
       const form = new FormData();
       form.append("audio", blob, `question.${extension}`);
-      const response = await fetch("/api/speech/transcribe", {
+      if (!supabase) throw new Error("Sign in to transcribe a recording.");
+      const response = await authenticatedFetch(supabase, "/api/speech/transcribe", {
         method: "POST",
         body: form,
         signal: controller.signal,
@@ -443,6 +699,20 @@ export default function Home() {
     }
   }
 
+  if (!authReady) {
+    return <main className="auth-loading"><LoaderCircle className="spinner" size={22} /><span>Restoring your workspace…</span></main>;
+  }
+  if (!supabase) {
+    return (
+      <main className="auth-loading auth-config-error">
+        <TriangleAlert size={22} />
+        <h1>Authentication needs setup</h1>
+        <p>Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY, then restart the app.</p>
+      </main>
+    );
+  }
+  if (!user) return <AuthScreen supabase={supabase} />;
+
   return (
     <main className={`app-shell ${sourcesOpen ? "" : "sources-collapsed"}`}>
       <header className="topbar">
@@ -450,14 +720,77 @@ export default function Home() {
           <span className="brand-mark"><Sparkles size={18} strokeWidth={1.8} /></span>
         </div>
         <div className="topbar-actions">
+          <button
+            className="icon-button history-toggle"
+            onClick={() => {
+              setHistoryOpen((open) => !open);
+              setSourcesOpen(false);
+            }}
+            aria-label="Toggle chat history"
+            title="Chat history"
+          >
+            <PanelLeft size={17} />
+          </button>
           <button className="icon-button source-toggle" onClick={() => setSourcesOpen(!sourcesOpen)} aria-label="Toggle sources">
             <BookOpenText size={18} />
           </button>
           <button className="new-chat-button" onClick={startFresh}><span>＋</span> New chat</button>
+          <div className="account-menu-wrap" ref={accountMenuRef}>
+            <button
+              className="account-menu-trigger"
+              type="button"
+              aria-label="Open account menu"
+              aria-haspopup="menu"
+              aria-expanded={accountMenuOpen}
+              onClick={() => setAccountMenuOpen((open) => !open)}
+            >
+              <span className="account-avatar">{user.email?.slice(0, 1).toUpperCase() || <UserRound size={16} />}</span>
+              <ChevronDown className="account-menu-chevron" size={14} />
+            </button>
+            {accountMenuOpen && (
+              <div className="account-dropdown" role="menu" aria-label="Account">
+                <div className="account-dropdown-email">{user.email}</div>
+                <div className="account-dropdown-divider" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    void signOut();
+                  }}
+                >
+                  <LogOut size={15} />
+                  <span>Log out</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
       <div className="workspace">
+        {historyOpen && <button className="history-backdrop" aria-label="Close chat history" onClick={() => setHistoryOpen(false)} />}
+        <aside className={`history-sidebar ${historyOpen ? "history-open" : ""}`} aria-label="Chat history">
+          <div className="history-heading"><Clock3 size={15} /><span>Recent chats</span></div>
+          {historyError && <p className="history-error" role="alert">{historyError}</p>}
+          {historyLoading && sessions.length === 0 ? (
+            <div className="history-loading"><LoaderCircle className="spinner" size={15} /> Loading history…</div>
+          ) : sessions.length === 0 ? (
+            <p className="history-empty">Your conversations will appear here.</p>
+          ) : (
+            <div className="history-list">
+              {sessions.map((session) => (
+                <div className={`history-row ${session.id === activeSessionId ? "selected" : ""}`} key={session.id}>
+                  <button className="history-item" onClick={() => void openSession(session.id)} disabled={loading || historyLoading}>
+                    <MessageSquareText size={14} /><span>{session.title}</span>
+                  </button>
+                  <button className="history-action" title="Rename chat" aria-label={`Rename ${session.title}`} onClick={() => void renameSession(session)}><Pencil size={13} /></button>
+                  <button className="history-action delete-history" title="Delete chat" aria-label={`Delete ${session.title}`} onClick={() => void deleteSession(session)}><Trash2 size={13} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </aside>
         <section className="chat-column">
           <div className="chat-tabs" role="tablist" aria-label="Chat views">
             <button role="tab" aria-selected={activeView === "chat"} className={activeView === "chat" ? "selected" : ""} onClick={() => setActiveView("chat")}>Chat</button>
@@ -511,7 +844,7 @@ export default function Home() {
                       {turn.error && !turn.answer ? (
                         <div className="assistant-message-row">
                           <span className="conversation-avatar assistant-avatar" aria-label="AI assistant"><Sparkles size={16} /></span>
-                          <div className="error-box"><TriangleAlert size={17} /><span>{turn.error}</span><button onClick={() => void ask(turn.question)}>Try again</button></div>
+                          <div className="error-box"><TriangleAlert size={17} /><span>{turn.error}</span><button onClick={() => void ask(turn.question, turn.documentId, turn.id)}>Try again</button></div>
                         </div>
                       ) : turn.pending && !turn.answer ? (
                         <div className="assistant-message-row">
@@ -540,6 +873,23 @@ export default function Home() {
                             </div>
                             {turn.pending && <div className="loading-row stream-indicator"><LoaderCircle className="spinner" size={15} /><span>{turn.status || "Writing answer…"}</span></div>}
                             {turn.error && <div className="stream-error" role="alert">{turn.error}</div>}
+                            {!turn.pending && turn.answer && (
+                              <div className="answer-actions">
+                                <button type="button" title="Copy answer" aria-label="Copy answer" onClick={() => void copyAnswer(turn)}>
+                                  {copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied."
+                                    ? <Check size={14} />
+                                    : <Copy size={14} />}
+                                  <span>{copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied." ? "Copied" : "Copy"}</span>
+                                </button>
+                                <button type="button" title="Retry answer" aria-label="Retry answer" onClick={() => void ask(turn.question, turn.documentId, turn.id)} disabled={loading}>
+                                  <RefreshCw size={14} />
+                                  <span>Retry</span>
+                                </button>
+                                {copyFeedback?.turnId === turn.id && (
+                                  <span className="answer-action-feedback" role="status">{copyFeedback.message}</span>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}

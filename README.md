@@ -5,8 +5,8 @@ This repository implements the approved public chat MVP for the **illustrative S
 ## Architecture
 
 - `src/app/`: Next.js App Router chat UI, `/api/chat`, and a Cloudflare Workers AI transcription Route Handler (no separate API service).
-- `src/lib/`: Cloudflare Workers AI embeddings, transcription and text models, Supabase hybrid retrieval, and provider fallback.
-- `supabase/migrations/`: Postgres schema, pgvector/full-text indexes, atomic idempotent document replacement, corpus-wide and document-scoped hybrid search, and the server-side chat response cache.
+- `src/lib/`: Supabase Auth client, Cloudflare Workers AI embeddings, transcription and text models, Supabase hybrid retrieval, and provider fallback.
+- `supabase/migrations/`: Postgres schema, pgvector/full-text indexes, atomic idempotent document replacement, corpus-wide and document-scoped hybrid search, server-side chat response cache, and owner-scoped conversation history.
 - `ingestion/`: Python Docling indexing CLI; spreadsheet facts additionally retain sheet/row/cell coordinates.
 - `docs/`: the supplied local sample corpus. Files are not sent anywhere by this project until you explicitly run the ingestion CLI.
 
@@ -22,7 +22,7 @@ No credentials are committed. Copy `.env.example` to `.env.local` for the web ap
 ## Database setup
 
 1. Create a Supabase project.
-2. Apply all SQL migrations in `supabase/migrations/` in filename order in the Supabase SQL Editor. This includes the document-scoped search function used to summarize a selected file. To use Supabase CLI instead, initialize/link the CLI project first, then run `supabase db push`.
+2. Apply all SQL migrations in `supabase/migrations/` in filename order in the Supabase SQL Editor. This includes the document-scoped search function used to summarize a selected file and private chat history tables. To use Supabase CLI instead, initialize/link the CLI project first, then run `supabase db push`.
 3. The migration pins `extensions.vector(768)`. The default `@cf/baai/bge-base-en-v1.5` model returns 768 dimensions. If changing model or dimension, update `CF_EMBEDDING_DIMENSIONS` consistently **and** alter the migration's vector columns, function signature, and index before applying it.
 4. The tables have RLS enabled and no public policies. Only the Next.js server and ingestion CLI use the service-role key.
 
@@ -34,7 +34,14 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` in `.env.local`. Answer generation defaults to Cloudflare-hosted OpenAI GPT-OSS 120B, with GPT-OSS 20B as its transient-failure fallback. The 120B model is the quality-first primary; 20B is a lower-latency backup. Both are served by Workers AI, so you do not run model servers yourself. Cloudflare lists GPT-OSS 120B at $0.35 per million input tokens and $0.75 per million output tokens, and GPT-OSS 20B at $0.20 per million input tokens and $0.30 per million output tokens at the time of writing. "Open-weight" means the model weights are available; inference through Cloudflare is usage-priced and is not necessarily free. Set `CF_PRIMARY_TEXT_MODEL` or `CF_FALLBACK_TEXT_MODEL` to override these defaults; environment variables already configured in Vercel take precedence over `.env.example`. Speech recognition uses Cloudflare Workers AI Whisper Large v3 Turbo with Whisper as a transient-failure fallback. Open the URL printed by Next.js (normally `http://localhost:3000`).
+Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` in `.env.local`. The public Supabase URL and anon key are used by the browser auth client; the service-role key must remain server-only. Answer generation defaults to Cloudflare-hosted OpenAI GPT-OSS 120B, with GPT-OSS 20B as its transient-failure fallback. The 120B model is the quality-first primary; 20B is a lower-latency backup. Both are served by Workers AI, so you do not run model servers yourself. Cloudflare lists GPT-OSS 120B at $0.35 per million input tokens and $0.75 per million output tokens, and GPT-OSS 20B at $0.20 per million input tokens and $0.30 per million output tokens at the time of writing. "Open-weight" means the model weights are available; inference through Cloudflare is usage-priced and is not necessarily free. Set `CF_PRIMARY_TEXT_MODEL` or `CF_FALLBACK_TEXT_MODEL` to override these defaults; environment variables already configured in Vercel take precedence over `.env.example`. Speech recognition uses Cloudflare Workers AI Whisper Large v3 Turbo with Whisper as a transient-failure fallback. Open the URL printed by Next.js (normally `http://localhost:3000`).
+
+### Accounts and saved chats
+
+- Sign-up and sign-in use Supabase Auth with email/password or Google OAuth. Supabase Auth persists the browser session across reloads. Email/password accounts are created without an in-app verification gate; if Supabase project settings require email confirmation, users must still complete that provider-level setting.
+- Enable Google in Supabase **Authentication → Providers**, configure OAuth credentials, and add the local and production app URLs to **Authentication → URL Configuration → Redirect URLs**. Use the callback URL shown by Supabase's Google provider settings for the Google Cloud OAuth client.
+- Apply the `202610260001_chat_sessions.sql` migration. Chat sessions and turns are linked to `auth.users`, protected by row-level security, and accessed through authenticated API routes. Users can revisit, rename, and delete their own sessions. Sign-out clears the current in-memory workspace; saved conversations remain attached to the account.
+- The app verifies each bearer token with Supabase Auth before serving chat, document-list, transcription, or conversation-history APIs. Configure the public Supabase URL/anon key and server-side service-role key in local and Vercel environments.
 
 ### Voice features
 

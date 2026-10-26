@@ -14,6 +14,7 @@ const {
   retrieveEvidence,
   writeCachedResponse,
   applyQueryPolicy,
+  getRequestUser,
 } = vi.hoisted(() => ({
   buildCacheConfigurationHash: vi.fn(() => "configuration"),
   buildGroundedPrompt: vi.fn((question: string, records: Array<{ result_kind: string }>) =>
@@ -29,6 +30,7 @@ const {
   retrieveEvidence: vi.fn(),
   writeCachedResponse: vi.fn(),
   applyQueryPolicy: vi.fn(),
+  getRequestUser: vi.fn(),
 }));
 
 vi.mock("@/lib/chat-cache", () => ({
@@ -53,6 +55,7 @@ vi.mock("@/lib/retrieval", () => ({
 
 vi.mock("@/lib/prompt", () => ({ buildGroundedPrompt }));
 vi.mock("@/lib/query-policy", () => ({ applyQueryPolicy }));
+vi.mock("@/lib/supabase-auth", () => ({ getRequestUser }));
 
 import { POST } from "./route";
 
@@ -70,9 +73,24 @@ describe("POST /api/chat", () => {
     keepCitedSources.mockImplementation((answer) => ({ answer, citations: [] }));
     writeCachedResponse.mockResolvedValue(undefined);
     applyQueryPolicy.mockReturnValue({ allowed: true });
+    getRequestUser.mockResolvedValue({ id: "user-1" });
     generateStreamWithFallback.mockImplementation(async function* () {
       yield { text: "Summary text.", provider: "cloudflare-primary" };
     });
+  });
+
+  it("rejects requests without an authenticated user", async () => {
+    getRequestUser.mockResolvedValue(null);
+    const request = new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "What decisions were approved?" }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(401);
+    expect(retrieveEvidence).not.toHaveBeenCalled();
   });
 
   it("retrieves only the selected document when streaming a document summary", async () => {

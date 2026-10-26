@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabase } from "@/lib/retrieval";
+import { getRequestUser } from "@/lib/supabase-auth";
 
 export const runtime = "nodejs";
 
@@ -20,7 +21,10 @@ function relatedCount(value: RelatedCount): number {
   return item && typeof item.count === "number" ? item.count : 0;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const user = await getRequestUser(request);
+  if (!user) return NextResponse.json({ error: "Sign in to view indexed documents." }, { status: 401 });
+
   try {
     const { data, error } = await getSupabase()
       .from("documents")

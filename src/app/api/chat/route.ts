@@ -11,6 +11,7 @@ import { generateStreamWithFallback, generateWithFallback } from "@/lib/provider
 import { formatCitations, getSupabase, keepCitedSources, retrieveEvidence } from "@/lib/retrieval";
 import { buildGroundedPrompt } from "@/lib/prompt";
 import { applyQueryPolicy } from "@/lib/query-policy";
+import { getRequestUser } from "@/lib/supabase-auth";
 import type { ChatResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -133,6 +134,11 @@ function createEventStream(run: (emit: (event: string, data: unknown) => void) =
 }
 
 export async function POST(request: Request) {
+  const user = await getRequestUser(request);
+  if (!user) {
+    return NextResponse.json({ error: "Sign in to chat with your documents." }, { status: 401 });
+  }
+
   let body: unknown;
   try {
     body = await request.json();

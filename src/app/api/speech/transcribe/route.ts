@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { transcribeWithFallback } from "@/lib/providers";
+import { getRequestUser } from "@/lib/supabase-auth";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -16,6 +17,9 @@ const allowedAudioTypes = new Set([
 ]);
 
 export async function POST(request: Request) {
+  const user = await getRequestUser(request);
+  if (!user) return NextResponse.json({ error: "Sign in to transcribe a recording." }, { status: 401 });
+
   const contentLength = Number(request.headers.get("content-length") || 0);
   if (contentLength > maxAudioBytes + 64 * 1024) {
     return NextResponse.json({ error: "Recording is too large. Keep it under 2 MB and try again." }, { status: 413 });
