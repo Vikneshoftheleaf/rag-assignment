@@ -39,7 +39,8 @@ Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_SUPABASE_URL`, `NE
 ### Accounts and saved chats
 
 - Sign-up and sign-in use Supabase Auth with email/password or Google OAuth. Supabase Auth persists the browser session across reloads. Email/password accounts are created without an in-app verification gate; if Supabase project settings require email confirmation, users must still complete that provider-level setting.
-- Enable Google in Supabase **Authentication → Providers**, configure OAuth credentials, and add the local and production app URLs to **Authentication → URL Configuration → Redirect URLs**. Use the callback URL shown by Supabase's Google provider settings for the Google Cloud OAuth client.
+- Set Supabase **Authentication → URL Configuration → Site URL** to the production Vercel domain, not `localhost`. Add the production domain, local development URL, and any Vercel preview domains you use to **Redirect URLs** (for example, `https://your-app.vercel.app/**` and a narrowly scoped preview pattern). Email sign-up and Google OAuth explicitly redirect to the current app origin so users return to the domain where they started authentication.
+- Enable Google in Supabase **Authentication → Providers** and configure OAuth credentials. Use the callback URL shown by Supabase's Google provider settings for the Google Cloud OAuth client.
 - Apply the `202610260001_chat_sessions.sql` migration. Chat sessions and turns are linked to `auth.users`, protected by row-level security, and accessed through authenticated API routes. Users can revisit, rename, and delete their own sessions. Sign-out clears the current in-memory workspace; saved conversations remain attached to the account.
 - The app verifies each bearer token with Supabase Auth before serving chat, document-list, transcription, or conversation-history APIs. Configure the public Supabase URL/anon key and server-side service-role key in local and Vercel environments.
 

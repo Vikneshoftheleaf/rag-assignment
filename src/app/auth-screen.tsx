@@ -20,7 +20,11 @@ export function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
     setBusy(true);
     try {
       if (mode === "signup") {
-        const { data, error: signUpError } = await supabase.auth.signUp({ email, password });
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: window.location.origin },
+        });
         if (signUpError) throw signUpError;
         if (!data.session) {
           setNotice("Your account was created. Check your email if verification is enabled for this Supabase project.");
@@ -54,9 +58,8 @@ export function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
   return (
     <main className="auth-page">
       <header className="auth-topbar">
-        <Link className="auth-brand" href="/" aria-label="Silverline home">
+        <Link className="auth-brand" href="/" aria-label="Home">
           <span className="brand-mark"><Sparkles size={18} /></span>
-          <span>Silverline</span>
         </Link>
         <button className="auth-top-link" onClick={() => setMode(mode === "signup" ? "login" : "signup")}>
           {mode === "signup" ? "Log in" : "Create account"}

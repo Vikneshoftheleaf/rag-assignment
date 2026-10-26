@@ -22,6 +22,7 @@ import {
   Mic,
   MessageSquareText,
   PanelLeft,
+  PanelLeftClose,
   Pencil,
   PanelRightClose,
   RefreshCw,
@@ -143,7 +144,7 @@ export default function Home() {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(true);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
@@ -266,7 +267,8 @@ export default function Home() {
   }, [loadSessions, user]);
 
   useEffect(() => {
-    if (window.matchMedia("(max-width: 760px)").matches) {
+    if (window.matchMedia("(max-width: 900px)").matches) {
+      setHistoryOpen(false);
       setSourcesOpen(false);
     }
   }, []);
@@ -720,17 +722,6 @@ export default function Home() {
           <span className="brand-mark"><Sparkles size={18} strokeWidth={1.8} /></span>
         </div>
         <div className="topbar-actions">
-          <button
-            className="icon-button history-toggle"
-            onClick={() => {
-              setHistoryOpen((open) => !open);
-              setSourcesOpen(false);
-            }}
-            aria-label="Toggle chat history"
-            title="Chat history"
-          >
-            <PanelLeft size={17} />
-          </button>
           <button className="icon-button source-toggle" onClick={() => setSourcesOpen(!sourcesOpen)} aria-label="Toggle sources">
             <BookOpenText size={18} />
           </button>
@@ -770,7 +761,7 @@ export default function Home() {
 
       <div className="workspace">
         {historyOpen && <button className="history-backdrop" aria-label="Close chat history" onClick={() => setHistoryOpen(false)} />}
-        <aside className={`history-sidebar ${historyOpen ? "history-open" : ""}`} aria-label="Chat history">
+        <aside className={`history-sidebar ${historyOpen ? "history-open" : "history-hidden"}`} aria-label="Chat history">
           <div className="history-heading"><Clock3 size={15} /><span>Recent chats</span></div>
           {historyError && <p className="history-error" role="alert">{historyError}</p>}
           {historyLoading && sessions.length === 0 ? (
@@ -792,9 +783,26 @@ export default function Home() {
           )}
         </aside>
         <section className="chat-column">
-          <div className="chat-tabs" role="tablist" aria-label="Chat views">
-            <button role="tab" aria-selected={activeView === "chat"} className={activeView === "chat" ? "selected" : ""} onClick={() => setActiveView("chat")}>Chat</button>
-            <button role="tab" aria-selected={activeView === "faq"} className={activeView === "faq" ? "selected" : ""} onClick={() => setActiveView("faq")}>FAQs</button>
+          <div className="chat-toolbar">
+            <button
+              className="icon-button history-toggle"
+              onClick={() => {
+                const opening = !historyOpen;
+                setHistoryOpen(opening);
+                if (opening && window.matchMedia("(max-width: 900px)").matches) {
+                  setSourcesOpen(false);
+                }
+              }}
+              aria-label={historyOpen ? "Hide chat history" : "Show chat history"}
+              aria-pressed={historyOpen}
+              title={historyOpen ? "Hide chat history" : "Show chat history"}
+            >
+              {historyOpen ? <PanelLeftClose size={17} /> : <PanelLeft size={17} />}
+            </button>
+            <div className="chat-tabs" role="tablist" aria-label="Chat views">
+              <button role="tab" aria-selected={activeView === "chat"} className={activeView === "chat" ? "selected" : ""} onClick={() => setActiveView("chat")}>Chat</button>
+              <button role="tab" aria-selected={activeView === "faq"} className={activeView === "faq" ? "selected" : ""} onClick={() => setActiveView("faq")}>FAQs</button>
+            </div>
           </div>
 
           {activeView === "faq" ? (
@@ -918,15 +926,14 @@ export default function Home() {
               <div className="composer-footer"><span>Use Shift + Enter for a new line</span>
                 <div className="composer-actions">
                   <button
-                    aria-label={recording ? "Stop recording and transcribe" : "Record a question"}
-                    title={recording ? "Stop recording" : "Record a question"}
+                    aria-label={recording ? "Stop recording and transcribe" : transcribing ? "Transcribing question" : "Record a question"}
+                    title={recording ? "Stop recording" : transcribing ? "Transcribing question" : "Record a question"}
                     className={`record-button ${recording ? "is-recording" : ""}`}
                     type="button"
                     disabled={loading || transcribing}
                     onClick={toggleRecording}
                   >
                     {recording ? <Square size={15} /> : transcribing ? <LoaderCircle className="spinner" size={16} /> : <Mic size={17} />}
-                    <span>{recording ? "Stop" : transcribing ? "Transcribing" : "Voice"}</span>
                   </button>
                   <button aria-label="Send question" className="send-button" disabled={!question.trim() || loading || transcribing}><ArrowUp size={18} /></button>
                 </div>
