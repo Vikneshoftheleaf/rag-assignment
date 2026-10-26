@@ -12,6 +12,7 @@ import { formatCitations, getSupabase, keepCitedSources, retrieveEvidence } from
 import { buildGroundedPrompt } from "@/lib/prompt";
 import { applyQueryPolicy } from "@/lib/query-policy";
 import { getRequestUser } from "@/lib/supabase-auth";
+import { repairSplitWords } from "@/lib/answer-format";
 import type { ChatResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -81,7 +82,8 @@ async function answerQuestion(
     provider = result.provider;
   }
 
-  const cited = keepCitedSources(answer, formatCitations(selected));
+  const polishedAnswer = repairSplitWords(answer, selected.map((record) => record.content));
+  const cited = keepCitedSources(polishedAnswer, formatCitations(selected));
   const response: ChatResponse = {
     answer: cited.answer,
     citations: cited.citations,

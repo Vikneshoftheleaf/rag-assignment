@@ -138,12 +138,12 @@ describe("POST /api/chat", () => {
     expect(selected.slice(8).every((record) => record.result_kind === "chunk")).toBe(true);
   });
 
-  it("returns a redirect for out-of-scope questions without retrieving evidence", async () => {
+  it("returns the greeting redirect without retrieving evidence", async () => {
     applyQueryPolicy.mockReturnValue({ allowed: false, answer: "Use the document assistant." });
     const request = new Request("http://localhost/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ message: "Tell me a joke." }),
+      body: JSON.stringify({ message: "Hello!" }),
     });
 
     const response = await POST(request);

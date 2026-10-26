@@ -30,7 +30,7 @@ export function buildQuestionKey(question: string): string {
 export function buildCacheConfigurationHash(): string {
   return sha256(JSON.stringify({
     cacheConfigurationVersion,
-    promptVersion: "grounded-prompt-v5",
+    promptVersion: "grounded-prompt-v6",
     retrievalVersion: "hybrid-search-v4",
     responseMaxTokens: 1600,
     minimumRelevance: process.env.RETRIEVAL_MIN_SCORE || "0.18",
