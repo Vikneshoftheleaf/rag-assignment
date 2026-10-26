@@ -1,32 +1,331 @@
-# Silverline source-grounded assistant
+# Silverline Source-Grounded Assistant
 
-This repository implements the approved public chat MVP for the **illustrative Silverline corpus**. Silverline and every supplied file are fictional training samples. They are not real company information, approved records, filings, or professional advice.
+A full-stack retrieval-augmented generation (RAG) application for asking questions about the **illustrative Silverline sample documents**. Answers are generated from retrieved evidence, include source citations, and are saved in private, authenticated chat sessions.
 
-## Architecture
+> **Important:** Silverline and the documents in `docs/` are fictional training samples. They are not real company information, approved records, filings, or professional advice.
 
-- `src/app/`: Next.js App Router chat UI, `/api/chat`, and a Cloudflare Workers AI transcription Route Handler (no separate API service).
-- `src/lib/`: Supabase Auth client, Cloudflare Workers AI embeddings, transcription and text models, Supabase hybrid retrieval, and provider fallback.
-- `supabase/migrations/`: Postgres schema, pgvector/full-text indexes, atomic idempotent document replacement, corpus-wide and document-scoped hybrid search, server-side chat response cache, and owner-scoped conversation history.
-- `ingestion/`: Python Docling indexing CLI; spreadsheet facts additionally retain sheet/row/cell coordinates.
-- `docs/`: the supplied local sample corpus. Files are not sent anywhere by this project until you explicitly run the ingestion CLI.
+## Contents
 
-## Prerequisites
+- [Architecture at a glance](#architecture-at-a-glance)
+- [Technology stack](#technology-stack)
+- [Request and data flows](#request-and-data-flows)
+- [AI models](#ai-models)
+- [Authentication and authorization](#authentication-and-authorization)
+- [Database, retrieval, and cache](#database-retrieval-and-cache)
+- [Document ingestion with Docling](#document-ingestion-with-docling)
+- [Project structure](#project-structure)
+- [Local development](#local-development)
+- [Email and Google provider setup](#email-and-google-provider-setup)
+- [Deployment and hosting](#deployment-and-hosting)
+- [Environment variables](#environment-variables)
+- [API overview](#api-overview)
+- [Validation](#validation)
+- [Operational notes](#operational-notes)
 
-- Node.js 20.9+ and npm.
-- Python 3.10+ for local ingestion (Docling can need platform-specific system libraries and model downloads).
-- A Supabase project with SQL Editor or Supabase CLI access.
-- A Cloudflare account/API token with Workers AI access.
+## Architecture at a glance
 
-No credentials are committed. Copy `.env.example` to `.env.local` for the web application and set actual values only in your local secret store. The ingestion CLI also loads the repository-root `.env.local`; variables already set in the shell take precedence. The service-role key must remain server-side; do not prefix it with `NEXT_PUBLIC_`.
+The web application runs on Vercel. Supabase provides Auth and Postgres; Cloudflare Workers AI provides model inference. Document parsing and indexing are an explicit local Python CLI task, not a deployed service.
 
-## Database setup
+```mermaid
+flowchart LR
+    User[User browser]
+    subgraph Vercel["Vercel · Next.js App Router"]
+        UI["Chat UI<br/>Markdown · citations · voice"]
+        AuthClient["Supabase browser Auth client"]
+        ChatAPI["POST /api/chat<br/>SSE and JSON"]
+        ConversationAPI["/api/conversations"]
+        DocumentAPI["GET /api/documents"]
+        SpeechAPI["POST /api/speech/transcribe"]
+        AuthGuard["Verify Supabase access token"]
+        CacheLogic["Answer cache lookup"]
+        Retrieval["Hybrid retrieval orchestration"]
+        Prompt["Grounded prompt and answer cleanup"]
+    end
+    subgraph Supabase["Supabase"]
+        SupabaseAuth["Auth<br/>Email/password · Google"]
+        Postgres[("Postgres")]
+        Vector["pgvector + full-text search"]
+        ChatTables["Private chat_sessions<br/>and chat_turns"]
+        AnswerCache["chat_response_cache"]
+    end
+    subgraph Cloudflare["Cloudflare Workers AI"]
+        Embed["BGE embedding model"]
+        TextPrimary["GPT-OSS 120B"]
+        TextFallback["GPT-OSS 20B fallback"]
+        SpeechPrimary["Whisper Large v3 Turbo"]
+        SpeechFallback["Whisper fallback"]
+    end
+    subgraph Local["Local ingestion workstation"]
+        Docs["PDF · DOCX · XLSX"]
+        Docling["Docling parsing"]
+        Spreadsheet["openpyxl financial facts"]
+        Indexer["Chunk · embed · index CLI"]
+    end
 
-1. Create a Supabase project.
-2. Apply all SQL migrations in `supabase/migrations/` in filename order in the Supabase SQL Editor. This includes the document-scoped search function used to summarize a selected file and private chat history tables. To use Supabase CLI instead, initialize/link the CLI project first, then run `supabase db push`.
-3. The migration pins `extensions.vector(768)`. The default `@cf/baai/bge-base-en-v1.5` model returns 768 dimensions. If changing model or dimension, update `CF_EMBEDDING_DIMENSIONS` consistently **and** alter the migration's vector columns, function signature, and index before applying it.
-4. The tables have RLS enabled and no public policies. Only the Next.js server and ingestion CLI use the service-role key.
+    User --> UI
+    UI <--> AuthClient
+    AuthClient <--> SupabaseAuth
+    UI --> ChatAPI
+    UI --> ConversationAPI
+    UI --> DocumentAPI
+    UI --> SpeechAPI
+    ChatAPI --> AuthGuard
+    ConversationAPI --> AuthGuard
+    DocumentAPI --> AuthGuard
+    SpeechAPI --> AuthGuard
+    AuthGuard --> SupabaseAuth
+    ChatAPI --> CacheLogic
+    CacheLogic <--> AnswerCache
+    CacheLogic --> Retrieval
+    Retrieval --> Embed
+    Retrieval --> Vector
+    Retrieval --> Prompt
+    Prompt --> TextPrimary
+    TextPrimary -. transient failure .-> TextFallback
+    SpeechAPI --> SpeechPrimary
+    SpeechPrimary -. transient failure .-> SpeechFallback
+    ConversationAPI <--> ChatTables
+    ChatTables --- Postgres
+    AnswerCache --- Postgres
+    Vector --- Postgres
+    Docs --> Docling
+    Docs --> Spreadsheet
+    Docling --> Indexer
+    Spreadsheet --> Indexer
+    Indexer --> Embed
+    Indexer --> Postgres
+```
 
-## Run the web app locally
+### Major boundaries
+
+| Layer | Responsibility | Runs on |
+|---|---|---|
+| Frontend | Authentication screens, chat sessions, streaming UI, Markdown, citations, document panel, voice recording | Browser, delivered by Vercel |
+| Backend | Authenticated Next.js Route Handlers for chat, sessions, documents, and transcription | Vercel Node.js Functions |
+| Identity | Persistent sign-up/sign-in with email/password or Google OAuth | Supabase Auth |
+| Application data | User-owned sessions and turns, indexed documents, chunks, structured facts, answer cache | Supabase Postgres |
+| Retrieval | Vector similarity and PostgreSQL full-text matching | Supabase Postgres with pgvector |
+| Model inference | Embeddings, text generation, speech-to-text | Cloudflare Workers AI |
+| Ingestion | Parse local files, make chunks/facts, request embeddings, atomically replace indexed document data | Local Python environment |
+
+## Technology stack
+
+- **Frontend and backend:** Next.js 15 App Router, React 19, TypeScript, Node.js Route Handlers.
+- **UI:** React Markdown with GitHub Flavored Markdown support, Lucide icons, responsive CSS.
+- **Authentication:** Supabase Auth using the Supabase JavaScript client. Supports email/password and Google OAuth.
+- **Database:** Supabase-hosted PostgreSQL, `pgvector`, generated full-text search vectors, and SQL RPC functions.
+- **Text generation:** Cloudflare Workers AI GPT-OSS models.
+- **Embeddings:** Cloudflare Workers AI BGE base English model by default.
+- **Speech-to-text:** Cloudflare Workers AI Whisper models. The browser records audio; transcription runs on the server.
+- **Ingestion:** Python, Docling, openpyxl, and python-dotenv.
+- **Hosting:** Vercel for the Next.js application; Supabase for Auth/Postgres; Cloudflare for AI inference.
+
+## Request and data flows
+
+### Chat and RAG
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Browser as Next.js chat UI
+    participant API as Vercel /api/chat
+    participant Auth as Supabase Auth
+    participant Cache as Supabase answer cache
+    participant AI as Cloudflare Workers AI
+    participant DB as Supabase Postgres search
+    participant History as Conversation API
+
+    User->>Browser: Ask a document question
+    Browser->>API: POST with Supabase bearer token
+    API->>Auth: Verify access token
+    Auth-->>API: Authenticated user
+    API->>API: Apply greeting/courtesy/out-of-scope policy
+    API->>Cache: Check question + corpus + config key
+    alt Cache hit
+        Cache-->>API: Cached response and citations
+    else Cache miss
+        API->>AI: Embed question
+        AI-->>API: Query vector
+        API->>DB: Hybrid vector + full-text search
+        DB-->>API: Ranked chunks/facts with provenance
+        API->>API: Filter by relevance and select evidence
+        API->>AI: Generate grounded answer (streaming)
+        AI-->>Browser: Progress and answer-token events
+        AI-->>API: Completed generation
+        API->>API: Repair source-verifiable split words and citations
+        API->>Cache: Save successful response
+    end
+    API-->>Browser: Final answer, citations, abstention state
+    Browser->>History: Save turn in the active session
+    History->>Auth: Verify access token and session ownership
+    History-->>Browser: Saved turn
+    Browser-->>User: Render completed answer as Markdown
+```
+
+The `/api/chat` route returns ordinary JSON when requested without `Accept: text/event-stream`. The chat interface uses server-sent events (SSE) for progress and generated text. After generation, the final event carries the normalized answer and citations; the UI renders that completed answer as Markdown.
+
+### Document ingestion
+
+```mermaid
+flowchart LR
+    Files["Local docs/ files<br/>PDF · DOCX · XLSX"] --> Parse["Docling conversion"]
+    Parse --> Text["Text and table extraction"]
+    Text --> Chunk["Paragraph-aware chunks<br/>~1,100 chars, 120-char overlap"]
+    Files --> Workbook["openpyxl workbook extraction"]
+    Workbook --> Facts["Structured financial facts<br/>metric · scope · period · unit · value"]
+    Chunk --> Embed["Workers AI BGE embeddings"]
+    Facts --> Embed
+    Embed --> RPC["Supabase RPC<br/>replace_document_index"]
+    RPC --> Tables[("documents<br/>document_chunks<br/>structured_facts")]
+    Tables --> Search["pgvector + full-text indexes"]
+```
+
+Parsing happens locally. In normal indexing mode, document text/facts and embeddings are sent to Supabase and Cloudflare for indexing. Original source files are not uploaded by the CLI.
+
+## AI models
+
+Model IDs are configurable through environment variables. Defaults are defined in `.env.example` and the provider implementation.
+
+| Capability | Default model | Fallback | Provider |
+|---|---|---|---|
+| Text embeddings | `@cf/baai/bge-base-en-v1.5` (768 dimensions) | None configured | Cloudflare Workers AI |
+| Chat and answer generation | `@cf/openai/gpt-oss-120b` | `@cf/openai/gpt-oss-20b` | Cloudflare Workers AI |
+| Speech transcription | `@cf/openai/whisper-large-v3-turbo` | `@cf/openai/whisper` | Cloudflare Workers AI |
+
+The fallback text model is used for eligible transient provider failures before text has been emitted. A truncated response may be continued for up to two additional generation passes. The transcription route limits uploads to 2 MB and validates the audio media type.
+
+The text models are open-weight models served as hosted inference by Cloudflare; using them through Workers AI is not necessarily free. Check Cloudflare’s current [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) and account limits.
+
+## Authentication and authorization
+
+1. The browser signs up or signs in through Supabase Auth. Email/password and Google are supported.
+2. Supabase persists the authentication session in the browser.
+3. Authenticated frontend requests attach the Supabase access token as a bearer token.
+4. The API verifies the token with Supabase Auth before handling chat, session, document-list, or transcription requests.
+5. The server uses the Supabase service-role key for database operations only after verifying the user. Session queries and mutations are scoped to the authenticated user.
+6. `chat_sessions` and `chat_turns` have row-level security policies that restrict authenticated database access to rows owned by the user.
+
+The public Supabase URL and anon/publishable key are browser configuration, not secrets. **Never expose `SUPABASE_SERVICE_ROLE_KEY` or `CLOUDFLARE_API_TOKEN` in a `NEXT_PUBLIC_` variable.**
+
+### Email and Google provider setup
+
+- In Supabase **Authentication → Providers**, enable Email and Google as desired.
+- To allow immediate email/password sign-in, turn off email confirmation in the Supabase Auth settings. If email confirmation is enabled, it takes precedence over the app’s behavior.
+- Configure Google OAuth credentials in Supabase and Google Cloud. Use the callback URI shown by Supabase for the Google OAuth client.
+- Set Supabase **Authentication → URL Configuration → Site URL** to the production Vercel deployment.
+- Add the production domain, local development URL, and any preview origins used to Supabase’s **Redirect URLs** allowlist. Keep preview rules scoped to your own Vercel project.
+- Email confirmation and Google OAuth return users to the app origin where sign-up/sign-in started.
+
+## Database, retrieval, and cache
+
+Apply all migrations under `supabase/migrations/` in filename order.
+
+### Main tables
+
+| Table | Purpose |
+|---|---|
+| `documents` | Indexed document metadata, filename, type, checksum, and indexing time |
+| `document_chunks` | Extracted text chunks, source locations, metadata, and embeddings |
+| `structured_facts` | Spreadsheet facts with metric, scope, period, unit, value, source location, and embeddings |
+| `chat_sessions` | User-owned chat sessions and display titles |
+| `chat_turns` | User-owned questions, answers, citations, abstention state, and optional document scope |
+| `chat_response_cache` | Successful answer payloads with corpus/configuration versions and expiration |
+
+The corpus tables use vector and full-text indexes. Search functions combine cosine similarity and PostgreSQL full-text rank, returning the stronger of the two scores. The application filters retrieved results using `RETRIEVAL_MIN_SCORE` (default `0.18`), prioritizes structured facts for financial queries, and uses a larger evidence set for those queries. Document-scoped summaries call `document_hybrid_search`; other queries call `hybrid_search`.
+
+The default embeddings have **768 dimensions** to match the migration’s vector columns and search-function signatures. If you change the embedding model or dimensions, update the model configuration and database schema/functions consistently, then re-index the corpus.
+
+### Answer cache
+
+- Cache keys are based on normalized question text, the current corpus revision, and a configuration hash.
+- The corpus revision includes indexed document names, paths, and checksums. The config hash includes prompt/retrieval versions, model IDs, embedding dimensions, token limit, and relevance threshold.
+- Cached answers expire after 24 hours by default (`CHAT_CACHE_TTL_SECONDS`).
+- A prompt/model/corpus change produces a cache miss; cached answers are not user-specific because the indexed Silverline corpus is shared.
+- Cache read/write errors are logged; the system can continue with fresh generation if cache access fails.
+
+### Grounding and output quality
+
+- The prompt instructs the model to use only retrieved evidence and cite factual claims.
+- Answers preserve cited source labels and source locations; unsupported evidence results in an abstention rather than an invented answer.
+- Generated word fragments are repaired only when the joined word exists in retrieved source text. Malformed citation labels are normalized before the final response is cached and returned.
+- The UI shows plain text while streaming and renders the completed answer with React Markdown and GFM.
+- A lightweight query policy returns distinct messages for greetings, courtesy messages, and clearly unrelated requests. Ambiguous terms and document headings are allowed through to retrieval.
+
+## Document ingestion with Docling
+
+The CLI is under `ingestion/` and supports **PDF, DOCX, and XLSX**. It is not run during chat requests and is not deployed as part of the Vercel app.
+
+### What the ingestion pipeline does
+
+1. Recursively finds supported files under `docs/` (or the directory passed with `--docs-dir`).
+2. Uses Docling to convert source documents and extract structured text/table content. If structured text items are absent, it falls back to exported Markdown.
+3. Chunks text at paragraph boundaries, targets roughly 1,100 characters per chunk, and carries a 120-character overlap.
+4. Uses openpyxl to extract spreadsheet facts, preserving available sheet/row/cell provenance, financial period, scope, units, and values.
+5. Embeds chunks and facts in batches with the configured Cloudflare embedding model.
+6. Calls the Supabase `replace_document_index` RPC to replace a document’s index atomically. A SHA-256 checksum is stored for corpus revisioning and repeatable re-indexing.
+
+Missing cached spreadsheet formula values are reported as unavailable, not coerced to zero. Spreadsheet period and unit extraction handles fiscal quarter/half-year headings and declared sheet units where present. `--dry-run` parses files and reports chunk/fact counts without embedding or writing to Supabase.
+
+### Install and run ingestion on Windows
+
+From the repository root in PowerShell:
+
+```powershell
+py -3 -m venv ingestion/.venv
+ingestion/.venv/Scripts/python.exe -m pip install -r ingestion/requirements.txt
+ingestion/.venv/Scripts/python.exe ingestion/indexer.py --docs-dir docs --dry-run
+```
+
+After reviewing the dry run, set the ingestion credentials in the repository-root `.env.local` (or the process environment) and index:
+
+```powershell
+ingestion/.venv/Scripts/python.exe ingestion/indexer.py --docs-dir docs
+```
+
+The indexer loads `.env.local` from the repository root and does not override variables already set in the shell. Use `--docs-dir <path>` to index another local folder. Re-run indexing after changing source documents or ingestion code. **Do not run without `--dry-run` unless you intend to send extracted document content and embeddings to Supabase and Cloudflare.**
+
+## Project structure
+
+```text
+src/
+  app/
+    api/
+      chat/                    # Authenticated JSON/SSE RAG endpoint
+      conversations/           # Authenticated session/turn CRUD
+      documents/                # Authenticated indexed-document listing
+      speech/transcribe/        # Authenticated speech-to-text endpoint
+    auth-screen.tsx             # Sign-up and sign-in onboarding
+    page.tsx                    # Chat, history, sources, voice, and account UI
+    globals.css                 # Responsive application styling
+  lib/
+    answer-format.ts            # Source-aware generated-word repair
+    chat-cache.ts               # Cache keys, corpus revision, cache read/write
+    markdown.ts                 # Markdown citation normalization
+    prompt.ts                   # Grounded generation instructions
+    providers.ts                # Cloudflare embeddings, text, and speech APIs
+    query-policy.ts             # Greeting/courtesy/out-of-scope redirects
+    retrieval.ts                # Supabase search, citation formatting
+    supabase-auth.ts            # Server-side bearer-token verification
+    supabase-browser.ts         # Browser Supabase client and authenticated fetch
+supabase/
+  migrations/                   # Postgres schema, search functions, RLS, cache, chat
+ingestion/
+  indexer.py                    # Local Docling → embeddings → Supabase CLI
+  processor.py                  # Chunking and structured spreadsheet extraction
+  requirements.txt              # Python ingestion dependencies
+  tests/                        # Ingestion regression tests
+docs/                           # Fictional sample source documents
+```
+
+## Local development
+
+### Requirements
+
+- Node.js **20.9 or newer** and npm.
+- Python **3.10 or newer** for ingestion.
+- A Supabase project and a Cloudflare account with Workers AI access.
+
+### Install and configure the web application
 
 ```powershell
 Copy-Item .env.example .env.local
@@ -34,69 +333,81 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN` in `.env.local`. The public Supabase URL and anon key are used by the browser auth client; the service-role key must remain server-only. Answer generation defaults to Cloudflare-hosted OpenAI GPT-OSS 120B, with GPT-OSS 20B as its transient-failure fallback. The 120B model is the quality-first primary; 20B is a lower-latency backup. Both are served by Workers AI, so you do not run model servers yourself. Cloudflare lists GPT-OSS 120B at $0.35 per million input tokens and $0.75 per million output tokens, and GPT-OSS 20B at $0.20 per million input tokens and $0.30 per million output tokens at the time of writing. "Open-weight" means the model weights are available; inference through Cloudflare is usage-priced and is not necessarily free. Set `CF_PRIMARY_TEXT_MODEL` or `CF_FALLBACK_TEXT_MODEL` to override these defaults; environment variables already configured in Vercel take precedence over `.env.example`. Speech recognition uses Cloudflare Workers AI Whisper Large v3 Turbo with Whisper as a transient-failure fallback. Open the URL printed by Next.js (normally `http://localhost:3000`).
+Fill in the required variables described in [Environment variables](#environment-variables), then restart the development server. The app is normally available at `http://localhost:3000`.
 
-### Accounts and saved chats
+### Database initialization
 
-- Sign-up and sign-in use Supabase Auth with email/password or Google OAuth. Supabase Auth persists the browser session across reloads. Email/password accounts are created without an in-app verification gate; if Supabase project settings require email confirmation, users must still complete that provider-level setting.
-- Set Supabase **Authentication → URL Configuration → Site URL** to the production Vercel domain, not `localhost`. Add the production domain, local development URL, and any Vercel preview domains you use to **Redirect URLs** (for example, `https://your-app.vercel.app/**` and a narrowly scoped preview pattern). Email sign-up and Google OAuth explicitly redirect to the current app origin so users return to the domain where they started authentication.
-- Enable Google in Supabase **Authentication → Providers** and configure OAuth credentials. Use the callback URL shown by Supabase's Google provider settings for the Google Cloud OAuth client.
-- Apply the `202610260001_chat_sessions.sql` migration. Chat sessions and turns are linked to `auth.users`, protected by row-level security, and accessed through authenticated API routes. Users can revisit, rename, and delete their own sessions. Sign-out clears the current in-memory workspace; saved conversations remain attached to the account.
-- The app verifies each bearer token with Supabase Auth before serving chat, document-list, transcription, or conversation-history APIs. Configure the public Supabase URL/anon key and server-side service-role key in local and Vercel environments.
+Apply every SQL migration in `supabase/migrations/` in filename order using the Supabase SQL Editor. Alternatively, initialize/link the Supabase CLI to the project and run `supabase db push`.
 
-### Voice features
+The migrations create the corpus/search tables, pgvector and full-text indexes, hybrid-search functions, response cache, and private chat history tables. Index documents after migrations are applied.
 
-- Use the microphone control in the composer to record a question. The browser requests microphone permission, applies supported noise/echo cancellation, and stops automatically after 60 seconds. The transcript is inserted into the editable question field; it is not sent until you press Send.
-- Recordings are limited to 2 MB and supported browser formats (WebM, Ogg, MP4, WAV, or AAC). Transcription is handled server-side, so Cloudflare credentials are never exposed to the browser.
-- `POST /api/speech/transcribe` accepts multipart form data with an `audio` file and returns `{ transcript, provider }`.
+## Deployment and hosting
 
-`POST /api/chat` accepts `{ "message": "..." }` (1–2000 characters) and returns `{ answer, citations, abstained, provider? }`. The chat UI requests `text/event-stream` and receives progress events followed by incremental answer tokens and a final response with citations; callers without that `Accept` header receive the normal JSON response. On a cache miss, the route embeds the question, calls the `hybrid_search` database function, abstains if no results meet the configured relevance threshold, then streams output from the primary Cloudflare Workers AI model. It uses the fallback Cloudflare model for transient failures before any answer text has been emitted. Each generation pass allows up to 1,600 output tokens; if the model reports that it stopped at the token limit, the app requests up to two grounded continuations and joins them into one answer. The chat route allows up to 60 seconds so continuations have time to complete. The response prompt asks for a direct, polished answer with useful Markdown structure, source citations beside factual claims, and exact financial units and periods; summaries and requested drafts receive task-specific formatting guidance. Successful answers are cached for 24 hours by default; `CHAT_CACHE_TTL_SECONDS` changes the TTL. Cache keys include a normalized question, a revision derived from indexed document checksums and names, and the retrieval/model configuration. Consequently, document re-indexing that changes corpus content or a model/prompt configuration change naturally causes a cache miss. Cache read/write failures are logged and do not prevent a fresh answer. Cloudflare Workers AI has a daily free allocation; usage above the allowance may require a paid Workers plan. Check the current [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) for details.
+The configured deployment target is **Vercel** (`vercel.json` selects the Next.js framework). The same app may be hosted on another compatible Next.js platform, but deployment settings, streaming behavior, function duration limits, and environment configuration would need to be checked for that platform.
 
-Before cache lookup or retrieval, `/api/chat` applies a lightweight topic policy for the Silverline corpus. Greetings receive a short redirect, and queries without board, resolution, audit, financial, or document context receive a redirect that explains what the assistant can answer. In-scope questions continue through normal retrieval, citation, and caching behavior.
+### Deploy to Vercel
 
-## Index the sample corpus (explicit local action)
+1. Create/configure a Supabase project and a Cloudflare API token with Workers AI access.
+2. Apply all Supabase migrations in filename order.
+3. Set Supabase Auth Site URL, Redirect URLs, and enabled providers as described above.
+4. Index the corpus from a local machine with the Python CLI. Verify that indexed documents appear in the signed-in app.
+5. Import the repository into Vercel. Use the repository root as the project root; keep the detected Next.js framework and normal `npm install` / `next build` configuration.
+6. Set the Node.js runtime to 20.9 or newer.
+7. Add the environment variables in the next section to the appropriate Vercel Production, Preview, and Development environments.
+8. Deploy, then redeploy after changing environment variables.
+9. Smoke-test sign-up/sign-in, Google callback if enabled, opening a saved session, chat with citations, voice transcription, and sign-out.
 
-The CLI does not run during web requests. Run it only when you intend to send the selected `docs/` contents to your Supabase database and Cloudflare Workers AI for indexing/embedding.
+Vercel does not apply Supabase migrations or index the local `docs/` directory as part of a deployment. The Docling program remains a local ingestion tool. The chat route has a 60-second maximum duration; the transcription route has a 30-second maximum duration. Ensure the selected Vercel plan supports the required function duration and streaming.
 
-```powershell
-python -m venv ingestion/.venv
-ingestion/.venv/Scripts/python -m pip install -r ingestion/requirements.txt
-ingestion/.venv/Scripts/python ingestion/indexer.py --docs-dir docs --dry-run
-```
+### Hosted services
 
-For actual indexing, make sure the repository-root `.env.local` contains the Supabase and Cloudflare credentials, then omit `--dry-run`:
+- **Vercel:** frontend assets and Next.js Node.js Route Handler functions.
+- **Supabase:** Auth, PostgreSQL, pgvector, full-text search, application data, and answer cache.
+- **Cloudflare Workers AI:** embedding generation, answer generation, and speech transcription.
+- **Local workstation:** Docling parsing, spreadsheet extraction, and indexing command.
 
-```powershell
-ingestion/.venv/Scripts/python ingestion/indexer.py --docs-dir docs
-```
+## Environment variables
 
-The CLI uses Docling to parse PDF, DOCX, and XLSX and records page/section/table context where available. Workbook facts include metric, scope, period, units, value, and sheet/row/cell coordinates where extractable. Formula cells with missing cached values are reported as unavailable and never coerced to zero. A content checksum is stored and each source path is replaced atomically, so reruns do not duplicate chunks/facts. Source documents themselves are not uploaded.
+`.env.example` is the variable reference. Keep real secrets in local/Vercel secret configuration; do not commit `.env.local`.
 
-Financial workbook ingestion normalizes quarter and half-year headers to fiscal periods and inherits declared sheet units such as `₹ crore` (while keeping EPS per-share units distinct). After updating the ingestion code or changing source files, rerun the indexing command without `--dry-run` to replace the stored facts and their search embeddings; a dry run only parses locally and does not update Supabase.
+| Variable | Required | Used by | Purpose |
+|---|---:|---|---|
+| `SUPABASE_URL` | Yes | Server and ingestion | Supabase project URL for server-side service access |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | Server and ingestion | Server-only database key; bypasses RLS, so use only after API auth checks and never expose to the browser |
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Browser | Supabase project URL for Auth client |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes | Browser | Supabase anon/publishable key for Auth client |
+| `CLOUDFLARE_ACCOUNT_ID` | Yes | Server and ingestion | Cloudflare account used for Workers AI |
+| `CLOUDFLARE_API_TOKEN` | Yes | Server and ingestion | Token authorized for required Workers AI APIs |
+| `CF_EMBEDDING_MODEL` | No | Server and ingestion | Defaults to `@cf/baai/bge-base-en-v1.5` |
+| `CF_EMBEDDING_DIMENSIONS` | No | Server and ingestion | Defaults to `768`; must match embedding model and database vector schema |
+| `CF_PRIMARY_TEXT_MODEL` | No | Server | Defaults to `@cf/openai/gpt-oss-120b` |
+| `CF_FALLBACK_TEXT_MODEL` | No | Server | Defaults to `@cf/openai/gpt-oss-20b` |
+| `CF_PRIMARY_STT_MODEL` | No | Server | Defaults to `@cf/openai/whisper-large-v3-turbo` |
+| `CF_FALLBACK_STT_MODEL` | No | Server | Defaults to `@cf/openai/whisper` |
+| `RETRIEVAL_MIN_SCORE` | No | Server | Minimum retrieved evidence score; defaults to `0.18` |
+| `CHAT_CACHE_TTL_SECONDS` | No | Server | Cache lifetime in seconds; defaults to `86400` |
 
-## Deploy to Vercel
+The `NEXT_PUBLIC_` prefix makes a value available to browser JavaScript. Use it only for the Supabase URL and public anon/publishable key.
 
-The repository deploys as a single Next.js app. `vercel.json` selects the Next.js framework; Vercel’s default npm install and `next build` are used. The Python Docling CLI is **not** deployed as a Vercel service: run it locally when indexing documents.
+## API overview
 
-### Before the first deployment
+All listed routes require a valid Supabase bearer token.
 
-1. Create a Supabase project and a Cloudflare API token with Workers AI permission.
-2. In Supabase SQL Editor, apply every migration in `supabase/migrations/` in filename order, including `202610250003_document_scoped_search.sql` for per-document summaries.
-3. Index the sample corpus from your local machine. Follow [Index the sample corpus](#index-the-sample-corpus-explicit-local-action) below and run the command without `--dry-run`. Verify the documents appear after deployment through `/api/documents`.
-4. Push this repository to GitHub and import it in Vercel. Set the Vercel project **Root Directory** to the repository root (not `ingestion`). Leave the framework, install command, build command, and output directory on their detected/default settings.
-5. Set the Node.js version to 20.9 or newer, matching `package.json`.
-6. In Vercel Project Settings → Environment Variables, add these **server-side** values for Production and any Preview/Development environments you intend to use:
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-   - `CLOUDFLARE_ACCOUNT_ID`
-   - `CLOUDFLARE_API_TOKEN`
-7. Optionally set model/cache overrides, including speech model IDs, from `.env.example`. Never add a `NEXT_PUBLIC_` prefix to secrets.
-8. Deploy. Redeploy after changing Vercel environment variables.
-9. Smoke-test the deployment: open `/`, then `/api/documents` and confirm the indexed files are listed. Ask a question whose answer exists in the sample corpus and confirm the response includes citations.
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/chat` | `POST` | Accepts `{ "message": "...", "documentId"?: "uuid" }`; returns a JSON answer or SSE progress/token/final events based on the `Accept` header |
+| `/api/conversations` | `GET` | Lists the signed-in user’s sessions; `?id=<uuid>` loads a session and its turns |
+| `/api/conversations` | `POST` | Creates a chat session with a title |
+| `/api/conversations` | `PATCH` | Renames a session or upserts a conversation turn |
+| `/api/conversations?id=<uuid>` | `DELETE` | Deletes the signed-in user’s session and its turns |
+| `/api/documents` | `GET` | Lists indexed documents and chunk/fact counts |
+| `/api/speech/transcribe` | `POST` | Accepts multipart form data with an `audio` file and returns `{ transcript, provider }` |
 
-The chat, document, and transcription API routes explicitly use the Node.js runtime. AI routes have a 30-second maximum duration. Vercel cannot apply database migrations or ingest local files as part of the Next.js build. The service-role key and Cloudflare token must stay server-side. A Vercel deployment does not automatically create Supabase/Cloudflare accounts, configure secrets, or populate the index.
+The `documentId` chat option scopes retrieval to one selected document. Chat messages are limited to 2,000 characters. Audio uploads are limited to 2 MB.
 
-## Checks
+## Validation
+
+Run from the repository root:
 
 ```powershell
 npm.cmd run typecheck
@@ -105,4 +416,13 @@ npm.cmd run build
 python -m unittest discover -s ingestion/tests
 ```
 
-The automated tests cover citation formatting, model fallback policy, and ingestion text/table transformations. Provider, database, and full UI end-to-end checks require valid external service credentials and an indexed corpus.
+Tests cover provider response parsing and fallback, retrieval/citations, cache configuration, query policy, answer formatting, and ingestion transformations. Tests do not make live calls to Supabase or Cloudflare; a live smoke test requires configured services and an indexed corpus.
+
+## Operational notes
+
+- Keep `SUPABASE_SERVICE_ROLE_KEY` and `CLOUDFLARE_API_TOKEN` server-side.
+- Use Supabase Auth redirect allowlists for production, local, and required Vercel preview origins.
+- Apply migrations before deploying code that depends on their tables and RPC functions.
+- Re-index after changing source files, chunk extraction, structured fact extraction, or embedding configuration. Ensure the database schema still matches the selected vector dimensions.
+- Monitor Cloudflare inference usage, Vercel function duration, Supabase storage/database capacity, and cache hit behavior.
+- Source documents are fictional samples. For other data, verify rights, privacy, retention, and provider data-processing requirements before indexing or calling hosted inference APIs.
