@@ -62,6 +62,12 @@ function extractGeneratedText(payload: unknown): string {
 }
 
 export async function embedText(text: string): Promise<number[]> {
+  const [embedding] = await embedTexts([text]);
+  return embedding;
+}
+
+export async function embedTexts(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
   const account = requiredEnv("CLOUDFLARE_ACCOUNT_ID");
   const token = requiredEnv("CLOUDFLARE_API_TOKEN");
   const model = process.env.CF_EMBEDDING_MODEL || "@cf/baai/bge-base-en-v1.5";
@@ -71,27 +77,31 @@ export async function embedText(text: string): Promise<number[]> {
     {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ text: [text] }),
+      body: JSON.stringify({ text: texts }),
       signal: AbortSignal.timeout(timeout),
     },
   );
   const payload = await readJson(response, "Cloudflare Workers AI embeddings");
   const result = payload.result as { data?: unknown; shape?: number[] } | undefined;
-  const first = Array.isArray(result?.data) && Array.isArray(result.data[0])
-    ? result.data[0]
-    : Array.isArray(payload.data) && Array.isArray(payload.data[0])
-      ? payload.data[0]
+  const vectors = Array.isArray(result?.data) ? result.data
+    : Array.isArray(payload.data) ? payload.data
       : null;
-  if (!first || !first.every((item) => typeof item === "number")) {
+  if (
+    !vectors ||
+    vectors.length !== texts.length ||
+    !vectors.every((vector) =>
+      Array.isArray(vector) && vector.every((item) => typeof item === "number"))
+  ) {
     throw new ProviderError("Cloudflare returned an unexpected embedding response", false);
   }
-  if (first.length !== expectedDimensions) {
+  const embeddings = vectors as number[][];
+  if (embeddings.some((embedding) => embedding.length !== expectedDimensions)) {
     throw new ProviderError(
-      `Embedding dimension mismatch: expected ${expectedDimensions}, received ${first.length}`,
+      `Embedding dimension mismatch: expected ${expectedDimensions}`,
       false,
     );
   }
-  return first as number[];
+  return embeddings;
 }
 
 async function cloudflareGenerate(
@@ -415,13 +425,17 @@ async function* streamToCompletion(
       ? messages
       : continuationMessages(messages, answer);
     let stream: AsyncIterable<string> | undefined;
+    let continuationStarted = false;
 
     try {
       stream = await streamResponse(requestMessages);
       for await (const text of stream) {
-        const chunk = answer && text && !/\s$/.test(answer) && /^[\p{L}\p{N}]/u.test(text)
-          ? ` ${text}`
-          : text;
+        let chunk = text;
+        if (continuation > 0 && !continuationStarted && text) {
+          const joined = joinContinuation(answer, text);
+          chunk = joined.slice(answer.length);
+          continuationStarted = true;
+        }
         answer += chunk;
         yield { text: chunk, provider };
       }
@@ -433,7 +447,10 @@ async function* streamToCompletion(
         error,
       );
       const completion = await generateResponse(continuationMessages(messages, answer));
-      yield { text: completion, provider };
+      yield {
+        text: joinContinuation(answer, completion).slice(answer.length),
+        provider,
+      };
       return;
     }
 
@@ -462,13 +479,37 @@ function continuationMessages(messages: ChatMessage[], answer: string): ChatMess
 }
 
 function joinContinuation(answer: string, continuation: string): string {
+  const continuationWithoutOverlap = removeRepeatedContinuationPrefix(answer, continuation);
   if (
     answer &&
-    continuation &&
+    continuationWithoutOverlap &&
     !/\s$/.test(answer) &&
-    /^[\p{L}\p{N}]/u.test(continuation)
+    !/^\s/.test(continuationWithoutOverlap) &&
+    /[\p{L}\p{N}.!?:;)]$/u.test(answer) &&
+    /^[\p{L}\p{N}]/u.test(continuationWithoutOverlap)
   ) {
-    return `${answer} ${continuation}`;
+    return `${answer} ${continuationWithoutOverlap}`;
   }
-  return answer + continuation;
+  return answer + continuationWithoutOverlap;
+}
+
+function removeRepeatedContinuationPrefix(answer: string, continuation: string): string {
+  const answerWords = [...answer.matchAll(/[\p{L}\p{N}]+/gu)];
+  const continuationWords = [...continuation.matchAll(/[\p{L}\p{N}]+/gu)];
+  const maximumOverlap = Math.min(continuationWords.length, 40);
+
+  for (let overlap = maximumOverlap; overlap >= 8; overlap--) {
+    const prefix = continuationWords.slice(0, overlap)
+      .map((word) => word[0].toLocaleLowerCase("en"));
+    const finalStart = answerWords.length - overlap;
+    if (finalStart < 0 || answerWords.length - finalStart > 80) continue;
+    const matchesAtEnd = answerWords.slice(finalStart).every(
+      (word, index) => word[0].toLocaleLowerCase("en") === prefix[index],
+    );
+    if (!matchesAtEnd) continue;
+
+    const lastOverlappingWord = continuationWords[overlap - 1];
+    return continuation.slice(lastOverlappingWord.index! + lastOverlappingWord[0].length);
+  }
+  return continuation;
 }

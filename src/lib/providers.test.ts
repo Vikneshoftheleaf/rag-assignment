@@ -38,6 +38,22 @@ describe("answer provider fallback", () => {
     expect(fallback).not.toHaveBeenCalled();
   });
 
+  it("does not add spaces when the provider splits a word or identifier across chunks", async () => {
+    const primary = async () => (async function* () {
+      yield "Dec";
+      yield "isions";
+      yield " Q";
+      yield "2";
+    })();
+    const chunks = [];
+    for await (const chunk of generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      primary,
+    )) chunks.push(chunk);
+
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe("Decisions Q2");
+  });
+
   it("falls back when the primary stream fails before emitting answer text", async () => {
     const fallback = vi.fn(async () => (async function* () {
       yield "backup answer";
@@ -96,7 +112,7 @@ describe("answer provider fallback", () => {
     });
     await expect(stream.next()).resolves.toEqual({
       done: false,
-      value: { text: "Completed backup answer", provider: "cloudflare-fallback" },
+      value: { text: " Completed backup answer", provider: "cloudflare-fallback" },
     });
     await expect(stream.next()).resolves.toEqual({ done: true, value: undefined });
     expect(fallbackNonStreaming).toHaveBeenCalledOnce();
@@ -104,6 +120,48 @@ describe("answer provider fallback", () => {
       role: "assistant",
       content: "partial",
     });
+  });
+
+  it("separates words at interrupted continuation boundaries", async () => {
+    const completePartial = vi.fn(async () => "continues.");
+    const primary = async () => (async function* () {
+      yield "This sentence";
+      throw new ProviderError("stream interrupted", true);
+    })();
+    const stream = generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      primary,
+      undefined,
+      undefined,
+      completePartial,
+    );
+
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe("This sentence continues.");
+  });
+
+  it("removes repeated text when completing an interrupted stream", async () => {
+    const completePartial = vi.fn(async () =>
+      "Only agenda items are listed. Where an excerpt did not specify an owner.",
+    );
+    const primary = async () => (async function* () {
+      yield "Only agenda items are listed. Where an excerpt did not";
+      throw new ProviderError("stream interrupted", true);
+    })();
+    const stream = generateStreamWithFallback(
+      [{ role: "user", content: "question" }],
+      primary,
+      undefined,
+      undefined,
+      completePartial,
+    );
+
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(
+      "Only agenda items are listed. Where an excerpt did not specify an owner.",
+    );
   });
 
   it("does not switch models after primary text has already streamed", async () => {

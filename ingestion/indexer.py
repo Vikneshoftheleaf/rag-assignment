@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.error
@@ -60,6 +62,76 @@ def embed_texts(texts: list[str], dimensions: int) -> list[list[float]]:
     return result
 
 
+_STOPWORDS = {
+    "about", "after", "again", "against", "also", "among", "been", "before",
+    "being", "between", "both", "could", "does", "during", "each", "from",
+    "have", "into", "more", "most", "other", "over", "same", "should", "some",
+    "such", "than", "that", "their", "there", "these", "they", "this", "those",
+    "through", "under", "very", "were", "what", "when", "where", "which",
+    "while", "with", "would", "your",
+}
+
+
+def _extracted_terms(content: str, limit: int = 12) -> list[str]:
+    terms = re.findall(r"\b[\w][\w&'-]{2,}\b", content, flags=re.UNICODE)
+    first_seen: dict[str, str] = {}
+    first_positions: dict[str, int] = {}
+    counts: Counter[str] = Counter()
+    for position, term in enumerate(terms):
+        normalized = term.casefold()
+        if normalized in _STOPWORDS or normalized.isdigit():
+            continue
+        counts[normalized] += 1
+        first_seen.setdefault(normalized, term)
+        first_positions.setdefault(normalized, position)
+    return [
+        first_seen[term]
+        for term in sorted(counts, key=lambda item: (-counts[item], first_positions[item]))[:limit]
+    ]
+
+
+def prepare_retrieval_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    filename: str,
+    document_type_name: str,
+) -> list[dict[str, Any]]:
+    """Attach source-derived context; never rewrite or omit extracted chunk content."""
+    prepared: list[dict[str, Any]] = []
+    for chunk in chunks:
+        location = chunk.get("source_location") or {}
+        section = str(chunk.get("metadata", {}).get("section") or "").strip()
+        terms = _extracted_terms(chunk["content"])
+        context = [
+            f"Document: {filename}",
+            f"Type: {document_type_name}",
+        ]
+        if section:
+            context.append(f"Section: {section}")
+        for key in ("page", "table", "sheet", "row", "cell"):
+            value = location.get(key)
+            if value is not None:
+                context.append(f"{key.title()}: {value}")
+        if terms:
+            context.append("Extracted terms: " + ", ".join(terms))
+
+        prepared.append({
+            **chunk,
+            "metadata": {
+                **chunk.get("metadata", {}),
+                "retrieval": {
+                    "filename": filename,
+                    "document_type": document_type_name,
+                    "section": section or None,
+                    "source_location": location,
+                    "extracted_terms": terms,
+                },
+            },
+            "retrieval_text": " ".join(context),
+        })
+    return prepared
+
+
 @lru_cache(maxsize=1)
 def _document_converter() -> Any:
     from docling.document_converter import DocumentConverter
@@ -99,8 +171,16 @@ def index_document(path: Path, docs_root: Path, dry_run: bool = False) -> tuple[
         print(f"DRY RUN: {source_path} [{doc_type}] - {len(chunks)} chunks, {len(facts)} facts")
         return len(chunks), len(facts)
 
+    chunks = prepare_retrieval_chunks(
+        chunks,
+        filename=path.name,
+        document_type_name=doc_type,
+    )
     dimensions = int(os.getenv("CF_EMBEDDING_DIMENSIONS", "768"))
-    texts = [item["content"] for item in chunks]
+    texts = [
+        f"{item['content']}\n\n{item['retrieval_text']}".strip()
+        for item in chunks
+    ]
     texts.extend(
         f"{fact['metric']} {fact.get('scope') or ''} {fact.get('period') or ''} "
         f"{fact.get('unit') or ''} {fact['value_text']}"
@@ -110,6 +190,7 @@ def index_document(path: Path, docs_root: Path, dry_run: bool = False) -> tuple[
     for index, chunk in enumerate(chunks):
         chunk["chunk_index"] = index
         chunk["embedding"] = vectors[index]
+        chunk["search_text"] = chunk.pop("retrieval_text")
     for index, fact in enumerate(facts):
         fact["fact_index"] = index
         fact["embedding"] = vectors[len(chunks) + index]

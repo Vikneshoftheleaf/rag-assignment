@@ -59,7 +59,7 @@ flowchart LR
         Docs["PDF · DOCX · XLSX"]
         Docling["Docling parsing"]
         Spreadsheet["openpyxl financial facts"]
-        Indexer["Chunk · embed · index CLI"]
+        Indexer["Deterministic chunks · source metadata · index CLI"]
     end
 
     User --> UI
@@ -162,7 +162,7 @@ sequenceDiagram
     Browser-->>User: Render completed answer as Markdown
 ```
 
-The `/api/chat` route returns ordinary JSON when requested without `Accept: text/event-stream`. The chat interface uses server-sent events (SSE) for progress and generated text. After generation, the final event carries the normalized answer and citations; the UI renders that completed answer as Markdown.
+The `/api/chat` route returns ordinary JSON when requested without `Accept: text/event-stream`. The chat interface uses server-sent events (SSE) for progress and generated text. After generation, the final event carries the normalized answer and citations; the UI renders that completed answer as Markdown. Requests in an existing session include its session ID; the server loads the latest stored turns for that authenticated user and does not accept client-supplied history.
 
 ### Document ingestion
 
@@ -230,14 +230,23 @@ Apply all migrations under `supabase/migrations/` in filename order.
 | `chat_sessions` | User-owned chat sessions and display titles |
 | `chat_turns` | User-owned questions, answers, citations, abstention state, and optional document scope |
 | `chat_response_cache` | Successful answer payloads with corpus/configuration versions and expiration |
+| `turn_feedback` | Per-user answer ratings, query/answer/source snapshots, query and source embeddings, and retrieval match estimate |
 
 The corpus tables use vector and full-text indexes. Search functions combine cosine similarity and PostgreSQL full-text rank, returning the stronger of the two scores. The application filters retrieved results using `RETRIEVAL_MIN_SCORE` (default `0.18`), prioritizes structured facts for financial queries, and uses a larger evidence set for those queries. Document-scoped summaries call `document_hybrid_search`; other queries call `hybrid_search`.
 
 The default embeddings have **768 dimensions** to match the migration’s vector columns and search-function signatures. If you change the embedding model or dimensions, update the model configuration and database schema/functions consistently, then re-index the corpus.
 
+### Answer feedback and retrieval quality
+
+- Each completed answer offers thumbs-up/down feedback. Ratings and their associated question, answer, selected source passages, query embedding, and source embeddings are stored in `turn_feedback`.
+- Apply `supabase/migrations/202610270003_turn_feedback_retrieval_quality.sql` before enabling feedback. The table is private to server-side service-role access; API routes verify the signed-in user and only search that user’s ratings.
+- On each new question the app first compares its query embedding with that user’s rated questions from the same corpus revision and document scope. A close positive match boosts the previously helpful source IDs; a close negative match demotes those IDs. Normal hybrid retrieval still runs and supplies the evidence. The feedback match threshold defaults to `0.78` and can be set with `FEEDBACK_MATCH_MIN_SIMILARITY`.
+- The displayed **evidence match estimate** is the mean score of the top five selected results, not a verified accuracy probability. The separate feedback approval percentage is the user’s positive ratings divided by all of their ratings, with the number of ratings shown.
+
 ### Answer cache
 
 - Cache keys are based on normalized question text, the current corpus revision, and a configuration hash.
+- `chat_response_cache` must have a composite primary key on `(question_key, corpus_revision, configuration_hash)` for Supabase upserts. The migration `202610270001_chat_response_cache_composite_key.sql` upgrades an existing cache table created with an older key and removes duplicate cache entries before enforcing the composite key.
 - The corpus revision includes indexed document names, paths, and checksums. The config hash includes prompt/retrieval versions, model IDs, embedding dimensions, token limit, and relevance threshold.
 - Cached answers expire after 24 hours by default (`CHAT_CACHE_TTL_SECONDS`).
 - A prompt/model/corpus change produces a cache miss; cached answers are not user-specific because the indexed Silverline corpus is shared.
@@ -250,6 +259,7 @@ The default embeddings have **768 dimensions** to match the migration’s vector
 - Generated word fragments are repaired only when the joined word exists in retrieved source text. Malformed citation labels are normalized before the final response is cached and returned.
 - The UI shows plain text while streaming and renders the completed answer with React Markdown and GFM.
 - A lightweight query policy returns distinct messages for greetings, courtesy messages, and clearly unrelated requests. Ambiguous terms and document headings are allowed through to retrieval.
+- A conversation-intent layer distinguishes requests to reformat the immediately previous answer from information-seeking follow-ups. Reformatting preserves the previous answer's citations without retrieving or introducing new facts. Other questions retrieve using the current question plus recent user questions to resolve references, while the current retrieved sources remain the factual authority.
 
 ## Document ingestion with Docling
 
@@ -259,12 +269,15 @@ The CLI is under `ingestion/` and supports **PDF, DOCX, and XLSX**. It is not ru
 
 1. Recursively finds supported files under `docs/` (or the directory passed with `--docs-dir`).
 2. Uses Docling to convert source documents and extract structured text/table content. If structured text items are absent, it falls back to exported Markdown.
-3. Chunks text at paragraph boundaries, targets roughly 1,100 characters per chunk, and carries a 120-character overlap.
-4. Uses openpyxl to extract spreadsheet facts, preserving available sheet/row/cell provenance, financial period, scope, units, and values.
-5. Embeds chunks and facts in batches with the configured Cloudflare embedding model.
-6. Calls the Supabase `replace_document_index` RPC to replace a document’s index atomically. A SHA-256 checksum is stored for corpus revisioning and repeatable re-indexing.
+3. Creates paragraph- and sentence-aware source chunks, targeting at most 1,100 characters. Oversized paragraphs are split at sentence/word boundaries; chunks do not overlap, avoiding duplicated evidence while retaining all extracted text.
+4. Derives retrieval metadata deterministically from source content, filename, document type, section, and page/table/sheet location. No generative text model rewrites or segments evidence.
+5. Uses openpyxl to extract spreadsheet facts, preserving available sheet/row/cell provenance, financial period, scope, units, and values.
+6. Embeds each chunk together with its retrieval metadata, and embeds facts, using the configured Cloudflare embedding model. Chunk metadata is included in PostgreSQL full-text search as well.
+7. Calls the Supabase `replace_document_index` RPC to replace a document’s index atomically. A SHA-256 checksum is stored for corpus revisioning and repeatable re-indexing.
 
-Missing cached spreadsheet formula values are reported as unavailable, not coerced to zero. Spreadsheet period and unit extraction handles fiscal quarter/half-year headings and declared sheet units where present. `--dry-run` parses files and reports chunk/fact counts without embedding or writing to Supabase.
+Spreadsheet formulas using supported arithmetic, cell references, and `SUM` ranges are evaluated deterministically when cached results are blank or stale; unsupported or unavailable formulas are reported as unavailable, never coerced to zero. Spreadsheet period and unit extraction handles fiscal quarter/half-year headings and declared sheet units where present. `--dry-run` parses files and reports chunk/fact counts without embedding or writing to Supabase.
+
+Chunk content is kept as extracted source evidence; section and location are preserved separately, and extracted terms are source-derived lexical hints. Embeddings still use the configured Cloudflare embedding model. Apply the migration in `supabase/migrations/202610260002_chunk_retrieval_metadata.sql` before indexing with this version; existing document content remains searchable, and deterministic retrieval metadata is refreshed on re-index.
 
 ### Install and run ingestion on Windows
 
@@ -385,6 +398,7 @@ Vercel does not apply Supabase migrations or index the local `docs/` directory a
 | `CF_PRIMARY_STT_MODEL` | No | Server | Defaults to `@cf/openai/whisper-large-v3-turbo` |
 | `CF_FALLBACK_STT_MODEL` | No | Server | Defaults to `@cf/openai/whisper` |
 | `RETRIEVAL_MIN_SCORE` | No | Server | Minimum retrieved evidence score; defaults to `0.18` |
+| `FEEDBACK_MATCH_MIN_SIMILARITY` | No | Server | Minimum cosine similarity for feedback-based retrieval boosts/demotions; defaults to `0.78` |
 | `CHAT_CACHE_TTL_SECONDS` | No | Server | Cache lifetime in seconds; defaults to `86400` |
 
 The `NEXT_PUBLIC_` prefix makes a value available to browser JavaScript. Use it only for the Supabase URL and public anon/publishable key.
@@ -395,7 +409,8 @@ All listed routes require a valid Supabase bearer token.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/api/chat` | `POST` | Accepts `{ "message": "...", "documentId"?: "uuid" }`; returns a JSON answer or SSE progress/token/final events based on the `Accept` header |
+| `/api/chat` | `POST` | Accepts `{ "message": "...", "turnId"?: "uuid", "sessionId"?: "uuid", "documentId"?: "uuid" }`; returns a JSON answer or SSE progress/token/final events based on the `Accept` header, including an evidence-match estimate |
+| `/api/feedback` | `POST` | Accepts `{ "turnId": "uuid", "vote": 1 \| -1 }` to save the signed-in user’s thumbs-up/down rating |
 | `/api/conversations` | `GET` | Lists the signed-in user’s sessions; `?id=<uuid>` loads a session and its turns |
 | `/api/conversations` | `POST` | Creates a chat session with a title |
 | `/api/conversations` | `PATCH` | Renames a session or upserts a conversation turn |

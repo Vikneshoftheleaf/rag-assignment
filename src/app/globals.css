@@ -291,21 +291,44 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid #53a187; outli
 .answer-content th { background: #f5f8f5; font-weight: 620; }
 .answer-content hr { margin: 16px 0; border: 0; border-top: 1px solid #e5e9e5; }
 .answer-content a:not(.inline-citation) { color: var(--green-dark); text-decoration: underline; text-underline-offset: 2px; }
-.answer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.answer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .answer-actions button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 5px 8px;
+  display: inline-grid;
+  width: 30px;
+  height: 29px;
+  place-items: center;
+  padding: 0;
   border: 1px solid #e3e8e3;
   border-radius: 7px;
   color: #657069;
   background: #fff;
-  font-size: 11px;
 }
 .answer-actions button:hover:not(:disabled) { border-color: #cbd8ce; color: var(--green-dark); background: #f8fbf8; }
 .answer-actions button:disabled { cursor: wait; opacity: .55; }
 .answer-action-feedback { color: #758078; font-size: 11px; }
+.answer-footer { display: flex; flex-direction: column; gap: 7px; margin-top: 12px; }
+.answer-action-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.retrieval-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: #758078; font-size: 11px; }
+.retrieval-match, .feedback-approval { cursor: help; }
+.feedback-buttons { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.feedback-buttons button {
+  display: inline-grid;
+  width: 29px;
+  height: 27px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #e3e8e3;
+  border-radius: 7px;
+  color: #657069;
+  background: #fff;
+}
+.feedback-buttons button:hover:not(:disabled), .feedback-buttons button.selected {
+  border-color: #b7d2c3;
+  color: var(--green-dark);
+  background: #f0f7f2;
+}
+.feedback-buttons button:disabled { cursor: not-allowed; opacity: .5; }
+.feedback-error { color: #925146; }
 .inline-citation {
   display: inline-flex;
   align-items: center;

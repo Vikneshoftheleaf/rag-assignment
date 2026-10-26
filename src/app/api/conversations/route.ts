@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getRequestUser } from "@/lib/supabase-auth";
 import { getSupabase } from "@/lib/retrieval";
+import { determineConversationIntent, type ConversationTurn } from "@/lib/conversation-intent";
 
 export const runtime = "nodejs";
 
@@ -63,7 +64,54 @@ export async function GET(request: Request) {
       console.error("Could not load chat turns", turnsError);
       return NextResponse.json({ error: "Could not load messages for this chat." }, { status: 500 });
     }
-    return NextResponse.json({ session, turns });
+    const feedbackByTurn = new Map<string, {
+      vote: -1 | 1 | null;
+      retrieval_match_percent: number | null;
+    }>();
+    if (turns?.length) {
+      const { data: feedback, error: feedbackError } = await supabase
+        .from("turn_feedback")
+        .select("turn_id, vote, retrieval_match_percent")
+        .eq("user_id", user.id)
+        .in("turn_id", turns.map((turn) => turn.id));
+      if (feedbackError) {
+        console.warn("Could not load feedback for chat history", feedbackError.message);
+      } else {
+        for (const entry of feedback || []) {
+          feedbackByTurn.set(entry.turn_id, {
+            vote: entry.vote,
+            retrieval_match_percent: entry.retrieval_match_percent,
+          });
+        }
+      }
+    }
+    const conversationHistory: ConversationTurn[] = [];
+    const turnIntents = new Map<string, "search" | "transform">();
+    for (const turn of turns || []) {
+      const history = conversationHistory.slice(-3);
+      const intent = determineConversationIntent(turn.question, history);
+      turnIntents.set(turn.id, intent.kind);
+      conversationHistory.push({
+        question: turn.question,
+        answer: turn.answer,
+        citations: [],
+        abstained: turn.abstained,
+        retrievalMatchPercent: null,
+      });
+    }
+
+    return NextResponse.json({
+      session,
+      turns: (turns || []).map((turn) => ({
+        ...turn,
+        intent: turnIntents.get(turn.id) || "search",
+        feedback_id: feedbackByTurn.has(turn.id) ? turn.id : null,
+        feedback_vote: feedbackByTurn.get(turn.id)?.vote ?? null,
+        retrieval_match_percent: feedbackByTurn.get(turn.id)?.retrieval_match_percent ?? null,
+        feedback_approval_percent: null,
+        feedback_ratings_count: 0,
+      })),
+    });
   }
 
   const { data, error } = await supabase
@@ -171,7 +219,31 @@ export async function DELETE(request: Request) {
   if (!sessionId || !idSchema.safeParse(sessionId).success) {
     return NextResponse.json({ error: "Invalid chat session." }, { status: 400 });
   }
-  const { data, error } = await getSupabase().from("chat_sessions")
+  const supabase = getSupabase();
+  const { data: turns, error: turnsError } = await supabase
+    .from("chat_turns")
+    .select("id")
+    .eq("session_id", sessionId)
+    .eq("user_id", user.id);
+  if (turnsError) {
+    console.error("Could not load chat turns before deleting feedback", turnsError);
+    return NextResponse.json({ error: "Could not delete this chat." }, { status: 500 });
+  }
+  if (turns?.length) {
+    const { error: feedbackError } = await supabase
+      .from("turn_feedback")
+      .delete()
+      .eq("user_id", user.id)
+      .in("turn_id", turns.map((turn) => turn.id));
+    if (feedbackError && !["42P01", "PGRST205"].includes(feedbackError.code || "")) {
+      console.error("Could not delete feedback for chat turns", feedbackError);
+      return NextResponse.json({ error: "Could not delete feedback for this chat." }, { status: 500 });
+    }
+    if (feedbackError) {
+      console.warn("Feedback table is not installed; continuing with chat deletion", feedbackError.message);
+    }
+  }
+  const { data, error } = await supabase.from("chat_sessions")
     .delete()
     .eq("id", sessionId)
     .eq("user_id", user.id)

@@ -10,7 +10,6 @@ from typing import Any, Iterable
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx"}
 CHUNK_TARGET = 1100
-CHUNK_OVERLAP = 120
 
 
 def checksum_file(path: Path) -> str:
@@ -48,12 +47,40 @@ def _item_order(item: dict[str, Any], fallback: int) -> tuple[int, int]:
     return page, int(match.group(1)) if match else fallback
 
 
+def _split_oversized_paragraph(paragraph: str) -> list[str]:
+    parts: list[str] = []
+    remaining = paragraph
+    while len(remaining) > CHUNK_TARGET:
+        window = remaining[: CHUNK_TARGET + 1]
+        sentence_breaks = [
+            match.end()
+            for match in re.finditer(r"[.!?][\"')\]]*(?:\s+|$)", window)
+            if match.end() <= CHUNK_TARGET
+        ]
+        boundary = sentence_breaks[-1] if sentence_breaks else 0
+        if boundary < CHUNK_TARGET // 2:
+            whitespace = [match.end() for match in re.finditer(r"\s+", window) if match.end() <= CHUNK_TARGET]
+            boundary = whitespace[-1] if whitespace else CHUNK_TARGET
+        parts.append(remaining[:boundary])
+        remaining = remaining[boundary:]
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
 def chunk_text(text: str, *, heading: str = "", location: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Split text at paragraph boundaries and attach heading/source context."""
+    """Split all source text at semantic boundaries without truncation or overlap loss."""
     clean = re.sub(r"[ \t]+\n", "\n", text).strip()
     if not clean:
         return []
     paragraphs = [part.strip() for part in re.split(r"\n{2,}", clean) if part.strip()]
+    units: list[str] = []
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        pieces = _split_oversized_paragraph(paragraph)
+        for piece_index, piece in enumerate(pieces):
+            prefix = "\n\n" if paragraph_index > 0 and piece_index == 0 else ""
+            units.append(prefix + piece)
+
     chunks: list[dict[str, Any]] = []
     current: list[str] = []
     current_size = 0
@@ -62,7 +89,7 @@ def chunk_text(text: str, *, heading: str = "", location: dict[str, Any] | None 
         nonlocal current, current_size
         if not current:
             return
-        content = "\n\n".join(current)
+        content = "".join(current)
         if heading and not content.startswith(heading):
             content = f"{heading}\n\n{content}"
         chunks.append({
@@ -70,17 +97,13 @@ def chunk_text(text: str, *, heading: str = "", location: dict[str, Any] | None 
             "source_location": dict(location or {}),
             "metadata": {"section": heading} if heading else {},
         })
-        if CHUNK_OVERLAP and len(content) > CHUNK_OVERLAP:
-            current = [content[-CHUNK_OVERLAP:]]
-            current_size = len(current[0])
-        else:
-            current, current_size = [], 0
+        current, current_size = [], 0
 
-    for paragraph in paragraphs:
-        if current and current_size + len(paragraph) + 2 > CHUNK_TARGET:
+    for unit in units:
+        if current and current_size + len(unit) > CHUNK_TARGET:
             emit()
-        current.append(paragraph)
-        current_size += len(paragraph) + 2
+        current.append(unit)
+        current_size += len(unit)
     if current:
         emit()
     return chunks
@@ -125,7 +148,7 @@ def _table_chunks(doc: dict[str, Any]) -> list[dict[str, Any]]:
         for row_index, row in enumerate(ordered_rows):
             values = [row.get(column, "") for column in sorted(set(headers) | set(row))]
             label = "Header" if row_index == 0 else f"Row {row_index}"
-            lines.append(f"{label}: " + " | ".join(value for value in values if value))
+            lines.append(f"{label}: " + " | ".join(values))
         location = _provenance(table)
         location["table"] = table_index + 1
         result.append({
@@ -221,7 +244,20 @@ def _financial_period(header: str, filename_period: str | None, filename_fiscal_
         period = explicit.group(1).upper()
         fiscal_year = explicit.group(2)
         if fiscal_year:
-            return f"{period} FY{fiscal_year.replace('–', '-').replace('/', '-')}"
+            normalized_year = fiscal_year.replace("–", "-").replace("/", "-")
+            year_digits = re.sub(r"\D", "", normalized_year)
+            if len(year_digits) <= 2 and filename_fiscal_year:
+                filename_year = filename_fiscal_year.replace("–", "-").replace("/", "-")
+                start_year = re.match(r"(\d{4})-(\d{2,4})", filename_year)
+                if start_year:
+                    start = int(start_year.group(1))
+                    end = int(start_year.group(2))
+                    end = end if end > 99 else (start // 100) * 100 + end
+                    if year_digits == str(start)[-2:]:
+                        normalized_year = f"{start - 1}-{str(start)[-2:]}"
+                    elif year_digits == str(end)[-2:]:
+                        normalized_year = f"{start}-{str(end)[-2:]}"
+            return f"{period} FY{normalized_year}"
         if filename_fiscal_year:
             return f"{period} FY{filename_fiscal_year}"
         return period
@@ -276,12 +312,191 @@ def _financial_unit(header: str, metric: str, sheet_context: str) -> str | None:
     return None
 
 
+_FORMULA_TOKEN = re.compile(
+    r"\s*(?:(?P<qualified>'(?:[^']|'')+'!\$?[A-Z]{1,3}\$?\d+)"
+    r"|(?P<cell>\$?[A-Z]{1,3}\$?\d+)"
+    r"|(?P<number>(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)"
+    r"|(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<operator>[()+\-*/:,])"
+    r"|(?P<invalid>.))"
+)
+
+
+class _FormulaEvaluator:
+    """Evaluate common numeric workbook formulas without executing arbitrary code."""
+
+    def __init__(self, value_book: Any, formula_book: Any) -> None:
+        self.value_book = value_book
+        self.formula_book = formula_book
+        self.cache: dict[tuple[str, str], float | None] = {}
+        self.active: set[tuple[str, str]] = set()
+
+    def cell_value(self, sheet_name: str, coordinate: str) -> float | None:
+        coordinate = coordinate.replace("$", "").upper()
+        key = (sheet_name, coordinate)
+        if key in self.cache:
+            return self.cache[key]
+        if key in self.active:
+            return None
+
+        formula = self.formula_book[sheet_name][coordinate].value
+        if isinstance(formula, str) and formula.startswith("="):
+            self.active.add(key)
+            try:
+                result = self.evaluate(formula[1:], sheet_name)
+            except (ArithmeticError, ValueError, KeyError, IndexError):
+                result = None
+            finally:
+                self.active.remove(key)
+        else:
+            result = _numeric(self.value_book[sheet_name][coordinate].value)
+        self.cache[key] = result
+        return result
+
+    def evaluate(self, formula: str, sheet_name: str) -> float | None:
+        tokens: list[tuple[str, str]] = []
+        position = 0
+        while position < len(formula):
+            match = _FORMULA_TOKEN.match(formula, position)
+            if not match:
+                return None
+            position = match.end()
+            kind = next((name for name, value in match.groupdict().items() if value is not None), "")
+            if kind == "invalid":
+                return None
+            if kind:
+                tokens.append((kind, match.group(kind)))
+
+        class Parser:
+            def __init__(self, evaluator: _FormulaEvaluator) -> None:
+                self.evaluator = evaluator
+                self.index = 0
+
+            def peek(self, value: str | None = None) -> bool:
+                if self.index >= len(tokens):
+                    return False
+                return value is None or tokens[self.index][1] == value
+
+            def take(self) -> tuple[str, str]:
+                if self.index >= len(tokens):
+                    raise ValueError("Unexpected end of formula")
+                token = tokens[self.index]
+                self.index += 1
+                return token
+
+            def expression(self) -> float:
+                result = self.term()
+                while self.peek("+") or self.peek("-"):
+                    operator = self.take()[1]
+                    right = self.term()
+                    result = result + right if operator == "+" else result - right
+                return result
+
+            def term(self) -> float:
+                result = self.factor()
+                while self.peek("*") or self.peek("/"):
+                    operator = self.take()[1]
+                    right = self.factor()
+                    result = result * right if operator == "*" else result / right
+                return result
+
+            def reference(self) -> tuple[str, str]:
+                kind, value = self.take()
+                if kind not in {"cell", "qualified"}:
+                    raise ValueError("Expected a cell reference")
+                if kind == "qualified":
+                    sheet, coordinate = value.rsplit("!", 1)
+                    sheet = sheet[1:-1].replace("''", "'")
+                else:
+                    sheet, coordinate = sheet_name, value
+                return sheet, coordinate.replace("$", "").upper()
+
+            def factor(self) -> float:
+                if self.peek("+") or self.peek("-"):
+                    operator = self.take()[1]
+                    value = self.factor()
+                    return value if operator == "+" else -value
+                if self.peek("("):
+                    self.take()
+                    value = self.expression()
+                    if not self.peek(")"):
+                        raise ValueError("Unclosed formula parenthesis")
+                    self.take()
+                    return value
+
+                kind, value = tokens[self.index] if self.index < len(tokens) else ("", "")
+                if kind == "number":
+                    self.take()
+                    return float(value)
+                if (
+                    kind == "identifier"
+                    and value.upper() == "SUM"
+                    and self.index + 1 < len(tokens)
+                    and tokens[self.index + 1][1] == "("
+                ):
+                    self.take()
+                    self.take()
+                    total = 0.0
+                    while True:
+                        if self.index >= len(tokens):
+                            raise ValueError("Unclosed SUM")
+                        if tokens[self.index][0] in {"cell", "qualified"}:
+                            first_sheet, first_cell = self.reference()
+                            if self.peek(":"):
+                                self.take()
+                                last_sheet, last_cell = self.reference()
+                                if first_sheet != last_sheet:
+                                    raise ValueError("SUM ranges cannot cross worksheets")
+                                from openpyxl.utils.cell import range_boundaries
+
+                                min_col, min_row, max_col, max_row = range_boundaries(
+                                    f"{first_cell}:{last_cell}"
+                                )
+                                worksheet = self.evaluator.value_book[first_sheet]
+                                for row in worksheet.iter_rows(
+                                    min_row=min_row,
+                                    max_row=max_row,
+                                    min_col=min_col,
+                                    max_col=max_col,
+                                ):
+                                    for cell in row:
+                                        total += self.evaluator.cell_value(first_sheet, cell.coordinate) or 0
+                            else:
+                                total += self.evaluator.cell_value(first_sheet, first_cell) or 0
+                        else:
+                            total += self.expression()
+                        if self.peek(","):
+                            self.take()
+                            continue
+                        if not self.peek(")"):
+                            raise ValueError("Invalid SUM arguments")
+                        self.take()
+                        return total
+                if kind in {"cell", "qualified"}:
+                    sheet, coordinate = self.reference()
+                    value = self.evaluator.cell_value(sheet, coordinate)
+                    if value is None:
+                        raise ValueError("Formula references a nonnumeric or unavailable cell")
+                    return value
+                raise ValueError("Unsupported formula")
+
+        parser = Parser(self)
+        try:
+            result = parser.expression()
+            if parser.index != len(tokens) or not math.isfinite(result):
+                return None
+            return result
+        except (ArithmeticError, ValueError, KeyError, IndexError):
+            return None
+
+
 def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    """Read populated workbook cells; formulas with blank cached results are warnings, not zeroes."""
+    """Read numeric workbook cells, calculating supported formulas without treating blanks as zero."""
     from openpyxl import load_workbook
 
     value_book = load_workbook(path, read_only=True, data_only=True)
     formula_book = load_workbook(path, read_only=True, data_only=False)
+    evaluator = _FormulaEvaluator(value_book, formula_book)
     facts: list[dict[str, Any]] = []
     warnings: list[str] = []
     filename_period = re.search(r"(?<![A-Za-z0-9])(Q[1-4]|H[1-2])(?![A-Za-z0-9])", path.stem, re.I)
@@ -294,6 +509,8 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     )
     try:
         for values_sheet in value_book.worksheets:
+            if values_sheet.title.strip().casefold() == "dashboard":
+                continue
             formulas_sheet = formula_book[values_sheet.title]
             sheet_context = " ".join(
                 str(cell.value).strip()
@@ -308,33 +525,57 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
                         and formula_cell.value.startswith("=")
                     ):
                         continue
-                    cached_value = values_sheet.cell(formula_cell.row, formula_cell.column).value
-                    if cached_value is None:
+                    calculated_value = evaluator.cell_value(values_sheet.title, formula_cell.coordinate)
+                    if calculated_value is None:
                         warnings.append(
-                            f"{values_sheet.title}!{formula_cell.coordinate}: formula has no cached result; left unavailable"
+                            f"{values_sheet.title}!{formula_cell.coordinate}: formula result is unavailable or unsupported"
                         )
             for row in values_sheet.iter_rows():
-                populated = [cell for cell in row if cell.value is not None]
-                if not populated:
+                first = next((cell for cell in row if cell.value is not None), None)
+                if first is None:
                     continue
-                first = populated[0]
                 metric = str(first.value).strip()
                 if _numeric(first.value) is not None:
                     continue
                 headers: dict[int, str] = {}
                 if first.row > 1:
+                    header_row = first.row - 1
+                    for candidate_row in range(first.row - 1, max(0, first.row - 40), -1):
+                        candidate_values = [
+                            values_sheet.cell(candidate_row, col).value
+                            for col in range(2, values_sheet.max_column + 1)
+                        ]
+                        candidate_text = " ".join(
+                            str(value) for value in candidate_values if value is not None
+                        )
+                        if re.search(
+                            r"\b(?:quarter|half[\s-]*year|Q[1-4]|H[1-2]|FY\s*\d{2,4})\b",
+                            candidate_text,
+                            re.I,
+                        ):
+                            header_row = candidate_row
+                            break
                     for col in range(1, values_sheet.max_column + 1):
-                        header_val = values_sheet.cell(first.row - 1, col).value
+                        header_val = values_sheet.cell(header_row, col).value
                         if header_val is not None:
                             headers[col] = str(header_val).strip()
-                for cell in populated[1:]:
-                    number = _numeric(cell.value)
+                for column in range(first.column + 1, values_sheet.max_column + 1):
+                    from openpyxl.utils import get_column_letter
+
+                    coordinate = f"{get_column_letter(column)}{first.row}"
+                    cell_value = values_sheet.cell(row=first.row, column=column).value
+                    number = _numeric(cell_value)
+                    formula = formula_book[values_sheet.title][coordinate].value
+                    formula_evaluated = False
+                    if number is None and isinstance(formula, str) and formula.startswith("="):
+                        number = evaluator.cell_value(values_sheet.title, coordinate)
+                        formula_evaluated = number is not None
                     if number is None:
                         continue
-                    header = headers.get(cell.column, "")
+                    header = headers.get(column, "")
                     period = _financial_period(header, filename_period_text, filename_fiscal_year_text)
                     unit = _financial_unit(header, metric, sheet_context)
-                    value_text = str(cell.value).strip()
+                    value_text = str(cell_value).strip() if cell_value is not None else format(number, ".12g")
                     facts.append({
                         "metric": f"{metric} — {header}" if header else metric,
                         "scope": _infer_scope(metric, header, values_sheet.title, path.name),
@@ -344,10 +585,14 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
                         "numeric_value": number,
                         "source_location": {
                             "sheet": values_sheet.title,
-                            "row": cell.row,
-                            "cell": cell.coordinate,
+                            "row": first.row,
+                            "cell": coordinate,
                         },
-                        "metadata": {"row_label": metric, "column_header": header},
+                        "metadata": {
+                            "row_label": metric,
+                            "column_header": header,
+                            **({"formula": formula, "formula_evaluated": True} if formula_evaluated else {}),
+                        },
                     })
     finally:
         value_book.close()

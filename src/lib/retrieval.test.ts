@@ -17,11 +17,13 @@ describe("citation formatting", () => {
   it("provides stable reference labels and source context", () => {
     expect(formatCitations([sample])[0]).toEqual({
       id: "S1",
+      sourceId: "uuid",
       filename: "results.xlsx",
       documentType: "xlsx",
       location: { sheet: "H1 Results", row: 8, cell: "C8" },
       excerpt: "Revenue — H1: 120",
       kind: "fact",
+      score: 0.8,
     });
   });
 

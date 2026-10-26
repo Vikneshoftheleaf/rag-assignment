@@ -29,6 +29,8 @@ import {
   Sparkles,
   Square,
   TriangleAlert,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -47,10 +49,18 @@ type ChatTurn = {
   answer: string;
   citations: Citation[];
   abstained: boolean;
+  intent?: "search" | "transform";
   documentId?: string;
   pending?: boolean;
   status?: string;
   error?: string;
+  feedbackId?: string;
+  vote?: -1 | 1 | null;
+  feedbackPending?: boolean;
+  feedbackError?: string;
+  retrievalMatchPercent?: number | null;
+  feedbackApprovalPercent?: number | null;
+  feedbackRatingsCount?: number;
 };
 
 const suggestions = [
@@ -304,6 +314,14 @@ export default function Home() {
           answer: "",
           citations: [],
           abstained: false,
+          intent: undefined,
+          feedbackId: undefined,
+          vote: undefined,
+          feedbackPending: false,
+          feedbackError: undefined,
+          retrievalMatchPercent: undefined,
+          feedbackApprovalPercent: undefined,
+          feedbackRatingsCount: undefined,
           pending: true,
           status: undefined,
           error: undefined,
@@ -316,6 +334,7 @@ export default function Home() {
         citations: [],
         abstained: false,
         documentId,
+        intent: undefined as "search" | "transform" | undefined,
         pending: true,
       }]);
     setSourceView("answer");
@@ -328,12 +347,22 @@ export default function Home() {
         citations: [] as Citation[],
         abstained: false,
         documentId,
+        intent: undefined as "search" | "transform" | undefined,
+        feedbackId: undefined as string | undefined,
+        retrievalMatchPercent: undefined as number | null | undefined,
+        feedbackApprovalPercent: undefined as number | null | undefined,
+        feedbackRatingsCount: undefined as number | undefined,
       };
 
       const response = await authenticatedFetch(supabase, "/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ message, ...(documentId ? { documentId } : {}) }),
+        body: JSON.stringify({
+          message,
+          turnId,
+          ...(activeSessionId ? { sessionId: activeSessionId } : {}),
+          ...(documentId ? { documentId } : {}),
+        }),
       });
       if (!response.ok) {
         const payload = await response.json() as { error?: string };
@@ -346,8 +375,24 @@ export default function Home() {
         turnToSave.answer = payload.answer;
         turnToSave.citations = citations;
         turnToSave.abstained = payload.abstained;
+        turnToSave.intent = payload.intent;
+        turnToSave.feedbackId = payload.feedbackId;
+        turnToSave.retrievalMatchPercent = payload.retrievalMatchPercent;
+        turnToSave.feedbackApprovalPercent = payload.feedbackApprovalPercent;
+        turnToSave.feedbackRatingsCount = payload.feedbackRatingsCount;
         setTurns((existing) => existing.map((turn) => turn.id === turnId
-          ? { ...turn, answer: payload.answer, citations, abstained: payload.abstained, pending: false }
+          ? {
+            ...turn,
+            answer: payload.answer,
+            citations,
+            abstained: payload.abstained,
+            intent: payload.intent,
+            feedbackId: payload.feedbackId,
+            retrievalMatchPercent: payload.retrievalMatchPercent,
+            feedbackApprovalPercent: payload.feedbackApprovalPercent,
+            feedbackRatingsCount: payload.feedbackRatingsCount,
+            pending: false,
+          }
           : turn));
         setActiveSources(citations);
       } else {
@@ -386,12 +431,22 @@ export default function Home() {
             turnToSave.answer = payload.answer;
             turnToSave.citations = citations;
             turnToSave.abstained = payload.abstained;
+            turnToSave.intent = payload.intent;
+            turnToSave.feedbackId = payload.feedbackId;
+            turnToSave.retrievalMatchPercent = payload.retrievalMatchPercent;
+            turnToSave.feedbackApprovalPercent = payload.feedbackApprovalPercent;
+            turnToSave.feedbackRatingsCount = payload.feedbackRatingsCount;
             setTurns((existing) => existing.map((turn) => turn.id === turnId
               ? {
                 ...turn,
                 answer: payload.answer,
                 citations,
                 abstained: payload.abstained,
+                intent: payload.intent,
+                feedbackId: payload.feedbackId,
+                retrievalMatchPercent: payload.retrievalMatchPercent,
+                feedbackApprovalPercent: payload.feedbackApprovalPercent,
+                feedbackRatingsCount: payload.feedbackRatingsCount,
                 pending: false,
                 status: undefined,
               }
@@ -465,6 +520,44 @@ export default function Home() {
     }
   }
 
+  async function rateAnswer(turn: ChatTurn, vote: -1 | 1) {
+    if (!supabase || !turn.feedbackId || turn.feedbackPending) return;
+    setTurns((existing) => existing.map((item) => item.id === turn.id
+      ? { ...item, feedbackPending: true, feedbackError: undefined }
+      : item));
+    try {
+      const response = await authenticatedFetch(supabase, "/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ turnId: turn.feedbackId, vote }),
+      });
+      const payload = await response.json() as {
+        vote?: -1 | 1;
+        approvalPercent?: number | null;
+        ratingsCount?: number;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || "Could not save feedback.");
+      setTurns((existing) => existing.map((item) => item.id === turn.id
+        ? {
+          ...item,
+          vote: payload.vote,
+          feedbackApprovalPercent: payload.approvalPercent,
+          feedbackRatingsCount: payload.ratingsCount,
+          feedbackPending: false,
+        }
+        : item));
+    } catch (error) {
+      setTurns((existing) => existing.map((item) => item.id === turn.id
+        ? {
+          ...item,
+          feedbackPending: false,
+          feedbackError: error instanceof Error ? error.message : "Could not save feedback.",
+        }
+        : item));
+    }
+  }
+
   async function openSession(sessionId: string) {
     if (!supabase || !user || loading) return;
     setHistoryError("");
@@ -483,7 +576,13 @@ export default function Home() {
           answer: string;
           citations: Citation[];
           abstained: boolean;
+          intent: "search" | "transform";
           document_id: string | null;
+          feedback_id: string | null;
+          feedback_vote: -1 | 1 | null;
+          retrieval_match_percent: number | null;
+          feedback_approval_percent: number | null;
+          feedback_ratings_count: number;
         }>;
         error?: string;
       };
@@ -495,7 +594,13 @@ export default function Home() {
         answer: turn.answer,
         citations: turn.citations || [],
         abstained: turn.abstained,
+        intent: turn.intent,
         documentId: turn.document_id || undefined,
+        feedbackId: turn.feedback_id || undefined,
+        vote: turn.feedback_vote,
+        retrievalMatchPercent: turn.retrieval_match_percent,
+        feedbackApprovalPercent: turn.feedback_approval_percent,
+        feedbackRatingsCount: turn.feedback_ratings_count,
       })));
       const latestCitations = payload.turns?.at(-1)?.citations || [];
       setActiveSources(latestCitations);
@@ -882,20 +987,75 @@ export default function Home() {
                             {turn.pending && <div className="loading-row stream-indicator"><LoaderCircle className="spinner" size={15} /><span>{turn.status || "Writing answer…"}</span></div>}
                             {turn.error && <div className="stream-error" role="alert">{turn.error}</div>}
                             {!turn.pending && turn.answer && (
-                              <div className="answer-actions">
-                                <button type="button" title="Copy answer" aria-label="Copy answer" onClick={() => void copyAnswer(turn)}>
-                                  {copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied."
-                                    ? <Check size={14} />
-                                    : <Copy size={14} />}
-                                  <span>{copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied." ? "Copied" : "Copy"}</span>
-                                </button>
-                                <button type="button" title="Retry answer" aria-label="Retry answer" onClick={() => void ask(turn.question, turn.documentId, turn.id)} disabled={loading}>
-                                  <RefreshCw size={14} />
-                                  <span>Retry</span>
-                                </button>
-                                {copyFeedback?.turnId === turn.id && (
-                                  <span className="answer-action-feedback" role="status">{copyFeedback.message}</span>
-                                )}
+                              <div className="answer-footer">
+                                <div className="retrieval-feedback">
+                                  {turn.retrievalMatchPercent !== null && turn.retrievalMatchPercent !== undefined && (
+                                    <span
+                                      className="retrieval-match"
+                                      title="Estimated from the average relevance score of the five highest-scoring selected evidence records; this is not a verified accuracy rate."
+                                    >
+                                      Evidence match estimate: {turn.retrievalMatchPercent}%
+                                    </span>
+                                  )}
+                                  {turn.feedbackRatingsCount ? (
+                                    <span className="feedback-approval">
+                                      Your feedback approval: {turn.feedbackApprovalPercent ?? 0}% ({turn.feedbackRatingsCount} ratings)
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <div className="answer-action-row">
+                                  {turn.intent === "search" && <div className="feedback-buttons" aria-label="Rate this answer">
+                                    <button
+                                      type="button"
+                                      aria-label="Helpful answer"
+                                      aria-pressed={turn.vote === 1}
+                                      title={turn.feedbackId ? "This answer was helpful" : "Feedback storage is unavailable"}
+                                      disabled={!turn.feedbackId || turn.feedbackPending}
+                                      className={turn.vote === 1 ? "selected" : ""}
+                                      onClick={() => void rateAnswer(turn, 1)}
+                                    >
+                                      <ThumbsUp size={15} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      aria-label="Unhelpful answer"
+                                      aria-pressed={turn.vote === -1}
+                                      title={turn.feedbackId ? "This answer was not helpful" : "Feedback storage is unavailable"}
+                                      disabled={!turn.feedbackId || turn.feedbackPending}
+                                      className={turn.vote === -1 ? "selected" : ""}
+                                      onClick={() => void rateAnswer(turn, -1)}
+                                    >
+                                      <ThumbsDown size={15} />
+                                    </button>
+                                    {turn.feedbackPending && <span className="answer-action-feedback" role="status">Saving feedback…</span>}
+                                    {turn.vote && !turn.feedbackPending && <span className="answer-action-feedback" role="status">Thanks for your feedback.</span>}
+                                    {turn.feedbackError && <span className="feedback-error" role="alert">{turn.feedbackError}</span>}
+                                  </div>}
+                                  <div className="answer-actions">
+                                    <button
+                                      type="button"
+                                      title={copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied." ? "Copied" : "Copy answer"}
+                                      aria-label="Copy answer"
+                                      onClick={() => void copyAnswer(turn)}
+                                    >
+                                      {copyFeedback?.turnId === turn.id && copyFeedback.message === "Answer copied."
+                                        ? <Check size={15} />
+                                        : <Copy size={15} />}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      title="Retry answer"
+                                      aria-label="Retry answer"
+                                      onClick={() => void ask(turn.question, turn.documentId, turn.id)}
+                                      disabled={loading}
+                                    >
+                                      <RefreshCw size={15} />
+                                    </button>
+                                    {copyFeedback?.turnId === turn.id && copyFeedback.message !== "Answer copied." && (
+                                      <span className="answer-action-feedback" role="status">{copyFeedback.message}</span>
+                                    )}
+                                  </div>
+                                </div>
                               </div>
                             )}
                           </div>
@@ -1008,7 +1168,9 @@ export default function Home() {
                 <article className="source-card" key={source.id}>
                   <div className="source-card-top"><span className="source-label">{source.id}</span><span className="file-type-icon"><FileGlyph type={source.documentType} /></span></div>
                   <h3>{source.filename}</h3>
-                  <span className="source-location">{formatLocation(source.location)}</span>
+                  <span className="source-location">
+                    {formatLocation(source.location)} · Score {typeof source.score === "number" ? source.score.toFixed(3) : "unavailable"}
+                  </span>
                   <blockquote>{source.excerpt}{source.excerpt.length >= 420 ? "…" : ""}</blockquote>
                 </article>
               ))}

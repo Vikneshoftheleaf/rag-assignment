@@ -7,17 +7,21 @@ const cacheResponseSchema = z.object({
   answer: z.string(),
   citations: z.array(z.object({
     id: z.string(),
+    sourceId: z.string().optional(),
     filename: z.string(),
     documentType: z.enum(["pdf", "docx", "xlsx"]),
     location: z.record(z.string(), z.unknown()),
     excerpt: z.string(),
     kind: z.enum(["chunk", "fact"]),
+    score: z.number(),
   })),
   abstained: z.boolean(),
   provider: z.enum(["cloudflare-primary", "cloudflare-fallback"]).optional(),
+  retrievalMatchPercent: z.number().nullable().optional(),
 });
 
-const cacheConfigurationVersion = "chat-response-v1";
+const cacheConfigurationVersion = "chat-response-v11";
+const cacheConflictTarget = "question_key, corpus_revision, configuration_hash";
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -30,8 +34,9 @@ export function buildQuestionKey(question: string): string {
 export function buildCacheConfigurationHash(): string {
   return sha256(JSON.stringify({
     cacheConfigurationVersion,
-    promptVersion: "grounded-prompt-v6",
-    retrievalVersion: "hybrid-search-v4",
+    promptVersion: "grounded-prompt-v10",
+    retrievalVersion: "conversation-aware-evidence-v10",
+    feedbackMatchSimilarity: process.env.FEEDBACK_MATCH_MIN_SIMILARITY || "0.78",
     responseMaxTokens: 1600,
     minimumRelevance: process.env.RETRIEVAL_MIN_SCORE || "0.18",
     embeddingModel: process.env.CF_EMBEDDING_MODEL || "@cf/baai/bge-base-en-v1.5",
@@ -90,15 +95,22 @@ export async function writeCachedResponse(
   }
 
   const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const cacheableResponse: ChatResponse = {
+    answer: response.answer,
+    citations: response.citations,
+    abstained: response.abstained,
+    provider: response.provider,
+    retrievalMatchPercent: response.retrievalMatchPercent,
+  };
   const { error } = await client
     .from("chat_response_cache")
     .upsert({
       question_key: questionKey,
       corpus_revision: corpusRevision,
       configuration_hash: configurationHash,
-      response,
+      response: cacheableResponse,
       expires_at: expiresAt,
-    }, { onConflict: "question_key" });
+    }, { onConflict: cacheConflictTarget });
 
   if (error) throw new Error(`Supabase chat cache write failed: ${error.message}`);
 }

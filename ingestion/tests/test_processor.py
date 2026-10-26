@@ -30,14 +30,15 @@ class ProcessorTests(unittest.TestCase):
                 "data": {"table_cells": [
                     {"start_row_offset_idx": 0, "start_col_offset_idx": 0, "text": "Metric"},
                     {"start_row_offset_idx": 0, "start_col_offset_idx": 1, "text": "H1"},
+                    {"start_row_offset_idx": 0, "start_col_offset_idx": 2, "text": "H2"},
                     {"start_row_offset_idx": 1, "start_col_offset_idx": 0, "text": "Revenue"},
-                    {"start_row_offset_idx": 1, "start_col_offset_idx": 1, "text": "100"},
+                    {"start_row_offset_idx": 1, "start_col_offset_idx": 2, "text": "100"},
                 ]},
             }],
         }
         chunks = chunks_from_docling(doc)
-        self.assertIn("Metric | H1", chunks[0]["content"])
-        self.assertIn("Revenue | 100", chunks[0]["content"])
+        self.assertIn("Metric | H1 | H2", chunks[0]["content"])
+        self.assertIn("Revenue |  | 100", chunks[0]["content"])
         self.assertEqual(chunks[0]["source_location"]["page"], 2)
         self.assertEqual(chunks[0]["source_location"]["table"], 1)
 
@@ -45,6 +46,20 @@ class ProcessorTests(unittest.TestCase):
         chunks = chunk_text("\n\n".join(["Evidence text."] * 140), heading="Minutes", location={"section": "Minutes"})
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(item["source_location"]["section"] == "Minutes" for item in chunks))
+
+    def test_oversized_paragraph_is_split_without_dropping_or_duplicating_text(self):
+        source = "Revenue increased in Q2. " * 179 + "Revenue increased in Q2."
+        chunks = chunk_text(source)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("".join(chunk["content"] for chunk in chunks), source)
+        self.assertTrue(all(len(chunk["content"]) <= 1100 for chunk in chunks))
+
+    def test_paragraph_boundaries_are_preserved_across_chunks(self):
+        source = "\n\n".join(["Revenue increased."] * 100)
+        chunks = chunk_text(source)
+
+        self.assertEqual("".join(chunk["content"] for chunk in chunks), source)
 
     def test_markdown_fallback_tracks_heading(self):
         chunks = markdown_fallback_chunks("# Board outcome\n\nThe board approved the report.")
@@ -71,14 +86,17 @@ class ProcessorTests(unittest.TestCase):
             workbook.save(path)
 
             facts, warnings = spreadsheet_facts(path)
-            self.assertEqual(len(facts), 1)
+            self.assertEqual(len(facts), 2)
             self.assertEqual(facts[0]["metric"], "Revenue — H1 FY2026-27 (₹ Crore)")
             self.assertEqual(facts[0]["scope"], "consolidated")
             self.assertEqual(facts[0]["period"], "H1 FY2026-27")
             self.assertEqual(facts[0]["unit"], "₹ crore")
             self.assertEqual(facts[0]["numeric_value"], 125.5)
             self.assertEqual(facts[0]["source_location"], {"sheet": "Consolidated", "row": 2, "cell": "B2"})
-            self.assertTrue(any("B3" in warning and "unavailable" in warning for warning in warnings))
+            self.assertEqual(facts[1]["metric"], "EBITDA — H1 FY2026-27 (₹ Crore)")
+            self.assertEqual(facts[1]["numeric_value"], 125.5)
+            self.assertTrue(facts[1]["metadata"]["formula_evaluated"])
+            self.assertFalse(warnings)
 
     def test_financial_facts_keep_quarter_comparatives_and_inherited_units(self):
         from openpyxl import Workbook
@@ -135,6 +153,56 @@ class ProcessorTests(unittest.TestCase):
             [fact["numeric_value"] for fact in revenue_facts[4:]],
             [1378.4, 1216.7, 2690.5, 2381.2],
         )
+
+    def test_formula_cells_are_evaluated_and_indexed_as_numeric_facts(self):
+        from openpyxl import Workbook
+        from processor import spreadsheet_facts
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Standalone Results"
+            sheet.append(["Particulars", "Q2 FY2026-27"])
+            sheet.append(["Revenue from operations", 100])
+            sheet.append(["Other income", 5])
+            sheet.append(["Total income", "=B2+B3"])
+            sheet.append(["Profit for the period", "=SUM(B2:B3)-10"])
+            workbook.save(path)
+
+            facts, warnings = spreadsheet_facts(path)
+
+        computed = {fact["metadata"]["row_label"]: fact for fact in facts}
+        self.assertEqual(computed["Total income"]["numeric_value"], 105)
+        self.assertEqual(computed["Profit for the period"]["numeric_value"], 95)
+        self.assertEqual(computed["Profit for the period"]["value_text"], "95")
+        self.assertTrue(computed["Profit for the period"]["metadata"]["formula_evaluated"])
+        self.assertFalse(warnings)
+
+    def test_formula_evaluator_resolves_cross_sheet_references(self):
+        from openpyxl import Workbook
+        from processor import spreadsheet_facts
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.xlsx"
+            workbook = Workbook()
+            results = workbook.active
+            results.title = "Standalone Results"
+            results.append(["Particulars", "Q2 FY2026-27"])
+            results.append(["Revenue", 120])
+            ratios = workbook.create_sheet("EPS & Ratios")
+            ratios.append(["Particulars", "Q2 FY2026-27"])
+            ratios.append(["PAT", 80])
+            ratios.append(["Basic EPS", "=B2/10"])
+            results.append(["Basic EPS", "='EPS & Ratios'!B3"])
+            workbook.save(path)
+
+            facts, warnings = spreadsheet_facts(path)
+
+        eps_facts = [fact for fact in facts if fact["metadata"]["row_label"] == "Basic EPS"]
+        self.assertEqual([fact["numeric_value"] for fact in eps_facts], [8, 8])
+        self.assertTrue(all(fact["metadata"]["formula_evaluated"] for fact in eps_facts))
+        self.assertFalse(warnings)
 
 
 if __name__ == "__main__":

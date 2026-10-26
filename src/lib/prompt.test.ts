@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildGroundedPrompt } from "./prompt";
+import { buildGroundedPrompt, buildTransformPrompt } from "./prompt";
 import type { RetrievedRecord } from "./types";
 
 const record: RetrievedRecord = {
@@ -53,6 +53,28 @@ describe("grounded summary prompts", () => {
     expect(system.content).toContain("Caveats or open questions");
   });
 
+  it("requires source citations and conservative action reporting for board decisions", () => {
+    const [system] = buildGroundedPrompt(
+      "What decisions and follow-up actions were recorded in the board meeting?",
+      [record],
+    );
+
+    expect(system.content).toContain("a source citation in every row");
+    expect(system.content).toContain("Do not infer actions or owners");
+    expect(system.content).toContain("Include each distinct agenda item only once");
+  });
+
+  it("preserves the auditor's limited-review wording without overstating assurance", () => {
+    const [system] = buildGroundedPrompt(
+      "What did the auditor conclude about the financial results?",
+      [record],
+    );
+
+    expect(system.content).toContain("preserve its exact limited-review wording");
+    expect(system.content).toContain("Do not strengthen limited assurance into a guarantee");
+    expect(system.content).toContain("Distinguish standalone and consolidated conclusions");
+  });
+
   it("guides requested drafts to be usable while marking unsupported details", () => {
     const [system] = buildGroundedPrompt("Draft an email announcing the board decision.", [record]);
 
@@ -60,5 +82,26 @@ describe("grounded summary prompts", () => {
     expect(system.content).toContain("Use only supported names, dates, decisions, amounts, and commitments");
     expect(system.content).toContain("short bracketed placeholder");
     expect(system.content).toContain("Cite sourced factual statements inline");
+  });
+
+  it("includes prior conversation only as reference context for a follow-up search", () => {
+    const [, user] = buildGroundedPrompt("What about H1?", [record], [
+      { question: "What revenue was reported for Q2?", answer: "₹1,245.6 crore [S1]" },
+    ]);
+
+    expect(user.content).toContain("prior assistant statements are not source evidence");
+    expect(user.content).toContain("What revenue was reported for Q2?");
+    expect(user.content).toContain("Current question: What about H1?");
+  });
+
+  it("instructs answer reformatting to preserve citations and avoid new facts", () => {
+    const [system, user] = buildTransformPrompt(
+      "Put the last response in bullet points.",
+      "Revenue was ₹1,245.6 crore. [S1]",
+    );
+
+    expect(system.content).toContain("Preserve its factual meaning");
+    expect(system.content).toContain("do not add facts, claims, or citations");
+    expect(user.content).toContain("Revenue was ₹1,245.6 crore. [S1]");
   });
 });
