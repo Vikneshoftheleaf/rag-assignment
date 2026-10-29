@@ -1,0 +1,74 @@
+[
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Standalone Results",
+    "cell": "B7",
+    "row_label": "I. Revenue from operations",
+    "column_header": "Quarter ended 30-Sep-2026",
+    "period": "Q2 FY2026-27",
+    "scope": "standalone",
+    "unit": "\u20b9 crore",
+    "value_text": "1245.6",
+    "numeric_value": 1245.6
+  },
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Standalone Results",
+    "cell": "D7",
+    "row_label": "I. Revenue from operations",
+    "column_header": "Half year ended 30-Sep-2026",
+    "period": "H1 FY2026-27",
+    "scope": "standalone",
+    "unit": "\u20b9 crore",
+    "value_text": "2430.8",
+    "numeric_value": 2430.8
+  },
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Consolidated Results",
+    "cell": "B7",
+    "row_label": "I. Revenue from operations",
+    "column_header": "Quarter ended 30-Sep-2026",
+    "period": "Q2 FY2026-27",
+    "scope": "consolidated",
+    "unit": "\u20b9 crore",
+    "value_text": "1378.4",
+    "numeric_value": 1378.4
+  },
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Consolidated Results",
+    "cell": "D7",
+    "row_label": "I. Revenue from operations",
+    "column_header": "Half year ended 30-Sep-2026",
+    "period": "H1 FY2026-27",
+    "scope": "consolidated",
+    "unit": "\u20b9 crore",
+    "value_text": "2690.5",
+    "numeric_value": 2690.5
+  },
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Balance Sheet",
+    "cell": "B7",
+    "row_label": "Property, plant and equipment",
+    "column_header": "As at 30-Sep-2026",
+    "period": "As at 30-Sep-2026",
+    "scope": null,
+    "unit": "\u20b9 crore",
+    "value_text": "680",
+    "numeric_value": 680
+  },
+  {
+    "filename": "Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx",
+    "sheet": "Balance Sheet",
+    "cell": "C7",
+    "row_label": "Property, plant and equipment",
+    "column_header": "As at 31-Mar-2026",
+    "period": "As at 31-Mar-2026",
+    "scope": null,
+    "unit": "\u20b9 crore",
+    "value_text": "640",
+    "numeric_value": 640
+  }
+]

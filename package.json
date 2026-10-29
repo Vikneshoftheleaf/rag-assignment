@@ -11,6 +11,9 @@
     "start": "next start",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:ingestion": "python -m unittest discover -s ingestion/tests",
+    "evaluate:workbooks": "python ingestion/evaluate_workbooks.py --docs-dir docs",
+    "validate:retrieval": "npm run test && npm run test:ingestion && npm run evaluate:workbooks",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -104,7 +104,7 @@ flowchart LR
 | Backend | Authenticated Next.js Route Handlers for chat, sessions, documents, and transcription | Vercel Node.js Functions |
 | Identity | Persistent sign-up/sign-in with email/password or Google OAuth | Supabase Auth |
 | Application data | User-owned sessions and turns, indexed documents, chunks, structured facts, answer cache | Supabase Postgres |
-| Retrieval | Vector similarity and PostgreSQL full-text matching | Supabase Postgres with pgvector |
+| Retrieval | Exact workbook-cell lookup for supported spreadsheet questions; vector similarity and PostgreSQL full-text matching for narrative evidence | Supabase Postgres with pgvector |
 | Model inference | Embeddings, text generation, speech-to-text | Cloudflare Workers AI |
 | Ingestion | Parse local files, make chunks/facts, request embeddings, atomically replace indexed document data | Local Python environment |
 
@@ -140,20 +140,35 @@ sequenceDiagram
     API->>Auth: Verify access token
     Auth-->>API: Authenticated user
     API->>API: Apply greeting/courtesy/out-of-scope policy
-    API->>Cache: Check question + corpus + config key
-    alt Cache hit
-        Cache-->>API: Cached response and citations
-    else Cache miss
-        API->>AI: Embed question
-        AI-->>API: Query vector
-        API->>DB: Hybrid vector + full-text search
-        DB-->>API: Ranked chunks/facts with provenance
-        API->>API: Filter by relevance and select evidence
-        API->>AI: Generate grounded answer (streaming)
-        AI-->>Browser: Progress and answer-token events
-        AI-->>API: Completed generation
-        API->>API: Repair source-verifiable split words and citations
-        API->>Cache: Save successful response
+    API->>API: Resolve intent and classify the question
+    alt Reformat previous answer
+        API->>AI: Reformat prior answer without new retrieval
+        AI-->>Browser: Answer tokens
+    else Information request
+        alt Supported spreadsheet lookup
+            API->>DB: Exact workbook-cell lookup
+            DB-->>API: Matching cells with sheet/row/cell provenance
+            API->>AI: Generate grounded answer (streaming)
+            AI-->>Browser: Progress and answer-token events
+            AI-->>API: Completed generation
+        else Narrative search
+            API->>AI: Embed question and focused query variants
+            AI-->>API: Query vectors
+            API->>Cache: Check eligible cache key
+            alt Cache hit
+                Cache-->>API: Cached response and citations
+            else Cache miss
+                API->>DB: Hybrid vector + full-text search
+                DB-->>API: Ranked chunks/facts with provenance
+                API->>API: Fuse and rerank candidates
+                API->>AI: Generate grounded answer (streaming)
+                AI-->>Browser: Progress and answer-token events
+                AI-->>API: Completed generation
+                API->>API: Repair source-verifiable split words and citations
+                API->>Cache: Save eligible successful response
+            end
+        end
+    end
     end
     API-->>Browser: Final answer, citations, abstention state
     Browser->>History: Save turn in the active session
@@ -168,16 +183,20 @@ The `/api/chat` route returns ordinary JSON when requested without `Accept: text
 
 ```mermaid
 flowchart LR
-    Files["Local docs/ files<br/>PDF · DOCX · XLSX"] --> Parse["Docling conversion"]
+    Files["Local docs/ files<br/>PDF · DOCX · XLSX"] --> Parse["Docling conversion<br/>PDF · DOCX"]
     Parse --> Text["Text and table extraction"]
-    Text --> Chunk["Paragraph-aware chunks<br/>~1,100 chars, 120-char overlap"]
-    Files --> Workbook["openpyxl workbook extraction"]
-    Workbook --> Facts["Structured financial facts<br/>metric · scope · period · unit · value"]
-    Chunk --> Embed["Workers AI BGE embeddings"]
+    Text --> Chunk["Paragraph- and sentence-aware chunks<br/>~1,100 characters"]
+    Files --> Workbook["openpyxl extraction<br/>XLSX"]
+    Workbook --> Facts["Structured financial facts"]
+    Workbook --> Cells["Cell-addressed evidence<br/>sheet · row · column · value"]
+    Chunk --> Embed["Workers AI embeddings"]
     Facts --> Embed
-    Embed --> RPC["Supabase RPC<br/>replace_document_index"]
-    RPC --> Tables[("documents<br/>document_chunks<br/>structured_facts")]
-    Tables --> Search["pgvector + full-text indexes"]
+    Chunk --> RPC["Supabase atomic index replacement"]
+    Facts --> RPC
+    Cells --> RPC
+    Embed --> RPC
+    RPC --> Tables[("documents<br/>document_chunks<br/>structured_facts<br/>workbook_cells")]
+    Tables --> Search["Hybrid search and exact cell lookup"]
 ```
 
 Parsing happens locally. In normal indexing mode, document text/facts and embeddings are sent to Supabase and Cloudflare for indexing. Original source files are not uploaded by the CLI.
@@ -227,12 +246,23 @@ Apply all migrations under `supabase/migrations/` in filename order.
 | `documents` | Indexed document metadata, filename, type, checksum, and indexing time |
 | `document_chunks` | Extracted text chunks, source locations, metadata, and embeddings |
 | `structured_facts` | Spreadsheet facts with metric, scope, period, unit, value, source location, and embeddings |
+| `workbook_cells` | Exact spreadsheet cells with worksheet, coordinates, row/column labels, values, units, periods, and formula metadata |
 | `chat_sessions` | User-owned chat sessions and display titles |
 | `chat_turns` | User-owned questions, answers, citations, abstention state, and optional document scope |
 | `chat_response_cache` | Successful answer payloads with corpus/configuration versions and expiration |
 | `turn_feedback` | Per-user answer ratings, query/answer/source snapshots, query and source embeddings, and retrieval match estimate |
 
-The corpus tables use vector and full-text indexes. Search functions combine cosine similarity and PostgreSQL full-text rank, returning the stronger of the two scores. The application filters retrieved results using `RETRIEVAL_MIN_SCORE` (default `0.18`), prioritizes structured facts for financial queries, and uses a larger evidence set for those queries. Document-scoped summaries call `document_hybrid_search`; other queries call `hybrid_search`.
+Retrieval has two main paths. For supported numeric and spreadsheet questions, the chat route classifies the request and calls `lookup_workbook_cells` against the indexed workbook cells. Lookup filters can use row labels, column headers, periods, scope, worksheet names, or explicit coordinates; an exact period header or “As at” date is preferred when the question names one. The matching cells, including their source locations, are provided as evidence for the answer. This path depends on the workbook having been extracted and indexed correctly.
+
+Bare requests for a known workbook sheet (for example, “balance sheet” or “show me the balance sheet”) are routed to an exact sheet-name cell lookup, then summarized from the returned source cells with citations, rather than relying on semantic vector search to infer the worksheet.
+
+When a question names an exact spreadsheet column header (for example, “Half year ended 30-Sep-2026”), that header is the authoritative period filter. The inferred shorthand (`H1`) is not also applied as a database filter, since it can match both current- and prior-year half-year columns. The returned cell is checked against the requested header before it is used to answer.
+
+Explicit “As at” dates are handled the same way: the date is matched against the indexed column header, which avoids depending on derived period metadata for balance-sheet cell retrieval.
+
+Other questions use hybrid retrieval over document chunks and structured facts. Supabase finds candidates using both vector similarity (question embeddings) and PostgreSQL full-text matching (question words), then combines the ranks with reciprocal-rank fusion. The application can add focused query variants for recognized question patterns; their results are fused with the original-query results. Candidates are then reranked using combined search scores and lexical overlap with the original question and source metadata. Feedback can influence ordering, but it does not replace search results or establish factual correctness.
+
+If the user selected a document, narrative hybrid search and workbook lookup are restricted to that document. Bare requests for a known workbook sheet (for example, “balance sheet”) use an exact sheet-name cell lookup rather than depending on vector search to infer the worksheet. Retrieved evidence is sent to the grounded-answer step with its filename and source location for citations. Retrieval scores and the displayed evidence-match estimate indicate ranking relevance; neither is a verified probability that the answer is correct.
 
 The default embeddings have **768 dimensions** to match the migration’s vector columns and search-function signatures. If you change the embedding model or dimensions, update the model configuration and database schema/functions consistently, then re-index the corpus.
 
@@ -267,17 +297,33 @@ The CLI is under `ingestion/` and supports **PDF, DOCX, and XLSX**. It is not ru
 
 ### What the ingestion pipeline does
 
-1. Recursively finds supported files under `docs/` (or the directory passed with `--docs-dir`).
-2. Uses Docling to convert source documents and extract structured text/table content. If structured text items are absent, it falls back to exported Markdown.
-3. Creates paragraph- and sentence-aware source chunks, targeting at most 1,100 characters. Oversized paragraphs are split at sentence/word boundaries; chunks do not overlap, avoiding duplicated evidence while retaining all extracted text.
-4. Derives retrieval metadata deterministically from source content, filename, document type, section, and page/table/sheet location. No generative text model rewrites or segments evidence.
-5. Uses openpyxl to extract spreadsheet facts, preserving available sheet/row/cell provenance, financial period, scope, units, and values.
-6. Embeds each chunk together with its retrieval metadata, and embeds facts, using the configured Cloudflare embedding model. Chunk metadata is included in PostgreSQL full-text search as well.
-7. Calls the Supabase `replace_document_index` RPC to replace a document’s index atomically. A SHA-256 checksum is stored for corpus revisioning and repeatable re-indexing.
+1. Recursively finds PDF, DOCX, and XLSX files under `docs/` (or the directory passed with `--docs-dir`). `--file` limits a run to one file.
+2. Converts PDF and DOCX with Docling, extracting text and tables with available source locations. If Docling fails for a PDF during a folder run, the CLI retries that PDF using PDFium text extraction.
+3. Groups extracted text into paragraph- and sentence-aware chunks targeting about 1,100 characters. Oversized paragraphs are split at sentence or word boundaries; chunks do not overlap.
+4. Reads XLSX files with openpyxl to extract structured financial facts and populated worksheet cells. Cell records preserve sheet, cell address, row label, column header, and value for exact spreadsheet lookups.
+5. Attaches deterministic, source-derived retrieval metadata such as filename, document type, section, and available page, table, or workbook location. A generative model does not rewrite or segment source evidence.
+6. For a real indexing run, embeds chunks and structured facts with the configured Cloudflare embedding model, then sends embeddings, chunks, facts, workbook cells, document metadata, and the SHA-256 checksum to Supabase.
+7. Calls the Supabase `replace_document_index_v2` RPC to atomically replace that document’s chunks, facts, and cells. The checksum is retained with document metadata and contributes to corpus revisioning.
 
-Spreadsheet formulas using supported arithmetic, cell references, and `SUM` ranges are evaluated deterministically when cached results are blank or stale; unsupported or unavailable formulas are reported as unavailable, never coerced to zero. Spreadsheet period and unit extraction handles fiscal quarter/half-year headings and declared sheet units where present. `--dry-run` parses files and reports chunk/fact counts without embedding or writing to Supabase.
+Use `--dry-run` to parse files and print counts (and workbook sheet dispositions) without embeddings, credentials, or database writes. A successful dry run checks extraction and reporting; it does not verify the configured embedding service or Supabase upload.
 
-Chunk content is kept as extracted source evidence; section and location are preserved separately, and extracted terms are source-derived lexical hints. Embeddings still use the configured Cloudflare embedding model. Apply the migration in `supabase/migrations/202610260002_chunk_retrieval_metadata.sql` before indexing with this version; existing document content remains searchable, and deterministic retrieval metadata is refreshed on re-index.
+Spreadsheet formulas using supported arithmetic, cell references, and `SUM` ranges are evaluated deterministically; the calculated result takes precedence over any cached formula value. Unsupported or unavailable formulas are reported as unavailable, never coerced to zero. Explicit “as at” dates in column headers take precedence over filename-level reporting periods, so balance-sheet dates are not mislabeled as quarter flows. Spreadsheet period and unit extraction handles fiscal quarter/half-year headings and declared sheet units where present.
+
+Each workbook index stores a worksheet manifest in document metadata: sheet name/state, used dimensions, populated/numeric/formula cell counts, structured-fact count, and a disposition (`structured_facts`, `narrative_or_unstructured`, or `excluded_dashboard`). No sheet is silently discarded. `--dry-run` prints every sheet disposition and reports chunk/fact counts without embedding or writing to Supabase. The replace-index RPC inserts extracted records in set-based statements, preserving atomic replacement while avoiding per-row PL/pgSQL insert loops.
+
+### Workbook extraction evaluation
+
+The reviewed source-cell cases in `ingestion/tests/fixtures/workbook_numeric_gold.json` are a release gate for value text, numeric value, period, scope, unit, row label, and exact cell provenance. They include standalone/consolidated financial values and both current and comparative balance-sheet dates.
+
+Run the workbook evaluator and Python regressions from the repository root in PowerShell:
+
+```powershell
+npm run validate:retrieval
+```
+
+`npm run test:ingestion` and `npm run evaluate:workbooks` are also available separately. The evaluator exits non-zero if any gold check fails; expected results are exact, not a similarity threshold. Add reviewed cases from each newly supported workbook/table shape before changing ingestion behavior. The TypeScript suite separately exercises query parsing, ambiguity/abstention, exact values, comparisons, follow-ups, and citations.
+
+Chunk content is kept as extracted source evidence; section and location are preserved separately, and extracted terms are source-derived lexical hints. Spreadsheet formulas using supported arithmetic, references, and `SUM` ranges are evaluated deterministically; unsupported or unavailable formulas are reported rather than silently coerced to zero. For Excel workbooks, populated cells are indexed with their sheet, A1 address, row label, column-header path, value, unit, period, and formula metadata. Numeric lookups use this cell index rather than relying only on embedding similarity. Apply all migrations, including `supabase/migrations/202610260002_chunk_retrieval_metadata.sql` and migrations `202610280001` through `202610280004`, before indexing and deploying this version. Re-index workbooks after applying the cell-index migration so the new cell records are populated.
 
 ### Install and run ingestion on Windows
 
@@ -289,13 +335,21 @@ ingestion/.venv/Scripts/python.exe -m pip install -r ingestion/requirements.txt
 ingestion/.venv/Scripts/python.exe ingestion/indexer.py --docs-dir docs --dry-run
 ```
 
-After reviewing the dry run, set the ingestion credentials in the repository-root `.env.local` (or the process environment) and index:
+The npm evaluation scripts use the `python` executable on `PATH`; activate `ingestion/.venv` first if you prefer the project's pinned ingestion dependencies.
+
+After reviewing the dry run, apply all migrations, including `202610280001_exact_structured_fact_lookup.sql`, `202610280002_bulk_document_index_replace.sql`, `202610280003_workbook_cell_index.sql`, and `202610280004_normalized_workbook_cell_lookup.sql`. The bulk writer migration replaces the row-by-row index writer and allows up to 60 seconds for the atomic database statement. The workbook-cell migration adds the cell-level index, direct coordinate lookup, and replacement RPC used by the current indexer; the normalized lookup migration makes row/header matching robust to punctuation in labels and dates. Then set the ingestion credentials in the repository-root `.env.local` (or the process environment) and index:
 
 ```powershell
 ingestion/.venv/Scripts/python.exe ingestion/indexer.py --docs-dir docs
 ```
 
-The indexer loads `.env.local` from the repository root and does not override variables already set in the shell. Use `--docs-dir <path>` to index another local folder. Re-run indexing after changing source documents or ingestion code. **Do not run without `--dry-run` unless you intend to send extracted document content and embeddings to Supabase and Cloudflare.**
+To retry a single failed document without re-embedding the rest of the corpus:
+
+```powershell
+ingestion/.venv/Scripts/python.exe ingestion/indexer.py --docs-dir docs --file docs/Silverline_Industries_Financial_Results_Q2_H1_FY2026-27.xlsx
+```
+
+The indexer loads `.env.local` from the repository root and does not override variables already set in the shell. Use `--docs-dir <path>` to index another local folder. Batch mode processes files in isolated workers so a native converter crash cannot stop later documents. If Docling fails for a PDF, the indexer retries text extraction with PDFium; this preserves page-level text but may not recover Docling's structured tables. Other failed files are reported by name, processing continues, and the command exits non-zero so they can be retried with `--file`. Re-run indexing after changing source documents or ingestion code. **Do not run without `--dry-run` unless you intend to send extracted document content and embeddings to Supabase and Cloudflare.**
 
 ## Project structure
 
@@ -318,6 +372,7 @@ src/
     providers.ts                # Cloudflare embeddings, text, and speech APIs
     query-policy.ts             # Greeting/courtesy/out-of-scope redirects
     retrieval.ts                # Supabase search, citation formatting
+    numeric-lookup.ts           # Exact workbook-cell query classification and follow-up handling
     supabase-auth.ts            # Server-side bearer-token verification
     supabase-browser.ts         # Browser Supabase client and authenticated fetch
 supabase/
@@ -352,7 +407,7 @@ Fill in the required variables described in [Environment variables](#environment
 
 Apply every SQL migration in `supabase/migrations/` in filename order using the Supabase SQL Editor. Alternatively, initialize/link the Supabase CLI to the project and run `supabase db push`.
 
-The migrations create the corpus/search tables, pgvector and full-text indexes, hybrid-search functions, response cache, and private chat history tables. Index documents after migrations are applied.
+The migrations create the corpus/search tables, pgvector and full-text indexes, hybrid-search and exact structured-fact and workbook-cell lookup functions, response cache, and private chat history tables. Apply all migrations before indexing or deploying this version. Re-index workbooks after applying `202610280003_workbook_cell_index.sql`; the migration creates the storage and lookup function, but does not backfill cells from previously indexed documents. If migration `202610280003` is already applied, apply `202610280004_normalized_workbook_cell_lookup.sql` to update its header matching; this function-only fix does not require re-indexing.
 
 ## Deployment and hosting
 

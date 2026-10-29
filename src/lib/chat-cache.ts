@@ -35,7 +35,7 @@ export function buildCacheConfigurationHash(): string {
   return sha256(JSON.stringify({
     cacheConfigurationVersion,
     promptVersion: "grounded-prompt-v10",
-    retrievalVersion: "conversation-aware-evidence-v10",
+    retrievalVersion: "cross-query-hybrid-rerank-v11",
     feedbackMatchSimilarity: process.env.FEEDBACK_MATCH_MIN_SIMILARITY || "0.78",
     responseMaxTokens: 1600,
     minimumRelevance: process.env.RETRIEVAL_MIN_SCORE || "0.18",

@@ -13,6 +13,7 @@ import {
   formatCitations,
   getSupabase,
   keepCitedSources,
+  lookupStructuredFacts,
   prepareFeedbackRetrieval,
   retrieveEvidence,
 } from "@/lib/retrieval";
@@ -20,7 +21,10 @@ import { buildGroundedPrompt, buildTransformPrompt } from "@/lib/prompt";
 import { applyQueryPolicy } from "@/lib/query-policy";
 import { getRequestUser } from "@/lib/supabase-auth";
 import { repairSplitWords } from "@/lib/answer-format";
-import { selectEvidence } from "@/lib/evidence-selection";
+import {
+  classifyNumericFollowUp,
+  classifyNumericQuery,
+} from "@/lib/numeric-lookup";
 import type { ChatResponse } from "@/lib/types";
 import {
   getFeedbackStats,
@@ -42,8 +46,6 @@ const requestSchema = z.object({
   documentId: z.string().uuid().optional(),
   sessionId: z.string().uuid().optional(),
 });
-
-const MIN_RELEVANCE = Number(process.env.RETRIEVAL_MIN_SCORE || "0.18");
 
 type StreamCallbacks = {
   onStatus: (status: string) => void;
@@ -100,6 +102,78 @@ async function answerQuestion(
     return response;
   }
 
+  const currentNumericClassification = classifyNumericQuery(message);
+  const numericClassification = currentNumericClassification.kind === "not_numeric" && history.length > 0
+    ? classifyNumericFollowUp(message, history.at(-1)?.question || "")
+    : currentNumericClassification;
+  if (numericClassification.kind === "lookup") {
+    const candidates = await lookupStructuredFacts(
+      { ...numericClassification.query, scope: null, bothScopes: true },
+      documentId,
+    );
+    if (candidates.length > 0) {
+      const groundingQuestion = numericClassification.query.sheetName
+        ? `Summarize the ${numericClassification.query.sheetName} worksheet.`
+        : message;
+      const prompt = buildGroundedPrompt(
+        groundingQuestion,
+        candidates,
+        history.map(({ question, answer }) => ({ question, answer })),
+      );
+      let answer: string;
+      let provider: ChatResponse["provider"];
+      if (streamCallbacks) {
+        streamCallbacks.onStatus("Reading matching spreadsheet cells…");
+        let generated = "";
+        for await (const chunk of generateStreamWithFallback(prompt)) {
+          generated += chunk.text;
+          provider = chunk.provider;
+          streamCallbacks.onToken(chunk.text);
+        }
+        answer = generated;
+      } else {
+        const result = await generateWithFallback(prompt);
+        answer = result.text;
+        provider = result.provider;
+      }
+
+      const polishedAnswer = repairSplitWords(
+        answer,
+        [groundingQuestion, ...candidates.map((record) => record.content)],
+      );
+      const cited = keepCitedSources(polishedAnswer, formatCitations(candidates));
+      const response: ChatResponse = {
+        answer: cited.answer,
+        citations: cited.citations,
+        abstained: false,
+        intent: "search",
+        provider,
+        retrievalMatchPercent: getRetrievalMatchPercent(candidates),
+      };
+
+      try {
+        const feedbackContext = await prepareFeedbackRetrieval(
+          retrievalQuestion,
+          userId,
+          corpusRevision,
+          documentId,
+        );
+        return addFeedbackMetadata(response, {
+          turnId,
+          userId,
+          documentId,
+          message,
+          corpusRevision,
+          queryEmbedding: feedbackContext.queryEmbedding,
+          sources: toFeedbackSources(candidates),
+        }, supabase);
+      } catch (error) {
+        console.warn("Could not prepare feedback for spreadsheet answer", error);
+      }
+      return response;
+    }
+  }
+
   const feedbackContext = await prepareFeedbackRetrieval(
     retrievalQuestion,
     userId,
@@ -139,8 +213,7 @@ async function answerQuestion(
   }
 
   const retrieved = await retrieveEvidence(retrievalQuestion, documentId, feedbackContext);
-  const eligible = retrieved.filter((record) => Number(record.score) >= MIN_RELEVANCE);
-  const selected = selectEvidence(message, eligible, 20);
+  const selected = retrieved;
   if (!selected.length) {
     return addFeedbackMetadata({
       answer: "I couldn’t find enough supporting information in the indexed Silverline sample documents to answer that.",
@@ -220,11 +293,15 @@ async function addFeedbackMetadata(
     documentId?: string;
     message: string;
     corpusRevision: string;
-    queryEmbedding: number[];
+    queryEmbedding: number[] | null;
     sources: ReturnType<typeof toFeedbackSources>;
   },
   supabase: ReturnType<typeof getSupabase>,
 ): Promise<ChatResponse> {
+  if (!input.queryEmbedding) {
+    console.warn("Skipping answer feedback storage because query embedding is unavailable");
+    return response;
+  }
   try {
     await recordTurnFeedback(supabase, {
       turnId: input.turnId,

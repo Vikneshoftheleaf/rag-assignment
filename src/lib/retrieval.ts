@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
-import { embedTexts } from "@/lib/providers";
+import { embedTexts, ProviderError } from "@/lib/providers";
 import type { Citation, RetrievedRecord } from "@/lib/types";
+import type { NumericQuery } from "@/lib/numeric-lookup";
 
 export function getSupabase() {
   const url = process.env.SUPABASE_URL;
@@ -12,11 +13,53 @@ export function getSupabase() {
 }
 
 export type FeedbackRetrievalContext = {
-  queryEmbedding: number[];
+  queryEmbedding: number[] | null;
   positiveSourceIds: Set<string>;
   negativeSourceIds: Set<string>;
   hasMatches: boolean;
 };
+
+const RRF_RANK_CONSTANT = 60;
+const QUERY_WEIGHTS = { primary: 2, expansion: 1 } as const;
+const RETRIEVAL_STOP_WORDS = new Set([
+  "a", "about", "after", "all", "an", "and", "any", "are", "as", "at", "be",
+  "before", "between", "by", "did", "do", "does", "for", "from", "give", "has",
+  "have", "how", "in", "into", "is", "it", "me", "of", "on", "or", "please",
+  "show", "some", "tell", "that", "the", "their", "these", "this", "those", "to",
+  "was", "were", "what", "when", "where", "which", "who", "why", "with", "would",
+  "workbook", "cell", "row", "column", "value", "sheet", "type",
+]);
+
+function lexicalTerms(text: string): Set<string> {
+  return new Set(
+    (text.toLocaleLowerCase("en").match(/[\p{L}\p{N}]+/gu) || [])
+      .filter((term) => term.length > 1 && !RETRIEVAL_STOP_WORDS.has(term)),
+  );
+}
+
+function lexicalCoverage(questionTerms: Set<string>, record: RetrievedRecord): number {
+  if (questionTerms.size === 0) return 0;
+  const metadata = record.metadata || {};
+  const location = record.source_location || {};
+  const recordTerms = lexicalTerms([
+    record.content,
+    record.source_filename,
+    metadata.section,
+    metadata.row_label,
+    metadata.metric,
+    metadata.sheet_name,
+    metadata.column_header,
+    metadata.period,
+    metadata.scope,
+    location.sheet,
+    location.section,
+  ].filter((value): value is string => typeof value === "string").join(" "));
+  let matches = 0;
+  for (const term of questionTerms) {
+    if (recordTerms.has(term)) matches++;
+  }
+  return matches / questionTerms.size;
+}
 
 export async function prepareFeedbackRetrieval(
   question: string,
@@ -24,13 +67,22 @@ export async function prepareFeedbackRetrieval(
   corpusRevision: string,
   documentId?: string,
 ): Promise<FeedbackRetrievalContext> {
-  const [queryEmbedding] = await embedTexts([question]);
+  let queryEmbedding: number[] | null;
+  try {
+    [queryEmbedding] = await embedTexts([question]);
+  } catch (error) {
+    if (!(error instanceof ProviderError) || !error.retryable) throw error;
+    console.warn("Feedback embedding unavailable; continuing without feedback retrieval", error.message);
+    queryEmbedding = null;
+  }
   const emptyContext: FeedbackRetrievalContext = {
     queryEmbedding,
     positiveSourceIds: new Set(),
     negativeSourceIds: new Set(),
     hasMatches: false,
   };
+
+  if (!queryEmbedding) return emptyContext;
 
   const { data, error } = await getSupabase().rpc("match_turn_feedback_sources", {
     p_query_embedding: JSON.stringify(queryEmbedding),
@@ -62,18 +114,32 @@ export async function retrieveEvidence(
   feedbackContext?: FeedbackRetrievalContext,
 ): Promise<RetrievedRecord[]> {
   const queries = buildRetrievalQueries(question);
-  const expandedEmbeddings = await embedTexts(feedbackContext
-    ? queries.slice(1)
-    : queries);
-  const embeddings = feedbackContext
-    ? [feedbackContext.queryEmbedding, ...expandedEmbeddings]
-    : expandedEmbeddings;
+  let embeddings: Array<number[] | null>;
+  if (feedbackContext?.queryEmbedding === null) {
+    embeddings = queries.map(() => null);
+  } else {
+    try {
+      const expandedEmbeddings = await embedTexts(feedbackContext
+        ? queries.slice(1)
+        : queries);
+      embeddings = feedbackContext
+        ? [feedbackContext.queryEmbedding, ...expandedEmbeddings]
+        : expandedEmbeddings;
+    } catch (error) {
+      if (!(error instanceof ProviderError) || !error.retryable) throw error;
+      console.warn("Query embeddings unavailable; continuing with text retrieval", error.message);
+      embeddings = feedbackContext
+        ? [feedbackContext.queryEmbedding, ...queries.slice(1).map(() => null)]
+        : queries.map(() => null);
+    }
+  }
+
   const supabase = getSupabase();
   const results = await Promise.all(queries.map(async (query, index) => {
     const { data, error } = await supabase.rpc(
       documentId ? "document_hybrid_search" : "hybrid_search",
       {
-        query_embedding: JSON.stringify(embeddings[index]),
+        query_embedding: embeddings[index] ? JSON.stringify(embeddings[index]) : null,
         query_text: query,
         match_count: 50,
         ...(documentId ? { target_document_id: documentId } : {}),
@@ -87,26 +153,45 @@ export async function retrieveEvidence(
     return (data || []) as RetrievedRecord[];
   }));
 
-  const merged = new Map<string, { record: RetrievedRecord; score: number; occurrences: number }>();
-  for (const result of results) {
-    for (const record of result) {
+  const merged = new Map<string, {
+    record: RetrievedRecord;
+    rrfScore: number;
+    backendScore: number;
+    firstSeen: number;
+  }>();
+  let firstSeen = 0;
+  for (const [queryIndex, result] of results.entries()) {
+    const queryWeight = queryIndex === 0
+      ? QUERY_WEIGHTS.primary
+      : QUERY_WEIGHTS.expansion;
+    for (const [rankIndex, record] of result.entries()) {
+      const backendScore = Math.max(0, Math.min(1, Number(record.score) || 0));
+      const rrfContribution = queryWeight / (RRF_RANK_CONSTANT + rankIndex + 1);
       const existing = merged.get(record.result_id);
       if (!existing) {
         merged.set(record.result_id, {
           record,
-          score: Number(record.score) || 0,
-          occurrences: 1,
+          rrfScore: rrfContribution,
+          backendScore,
+          firstSeen: firstSeen++,
         });
       } else {
-        existing.score = Math.max(existing.score, Number(record.score) || 0);
-        existing.occurrences++;
+        existing.rrfScore += rrfContribution;
+        existing.backendScore = Math.max(existing.backendScore, backendScore);
       }
     }
   }
 
-  return [...merged.values()]
-    .map(({ record, score, occurrences }) => {
-      const baseScore = Math.min(1, score + Math.min(0.12, (occurrences - 1) * 0.025));
+  const maximumRrfScore = Math.max(0, ...[...merged.values()].map(({ rrfScore }) => rrfScore));
+  const questionTerms = lexicalTerms(question);
+  const reranked = [...merged.values()]
+    .map(({ record, rrfScore, backendScore, firstSeen: order }) => {
+      const relativeRrfScore = maximumRrfScore > 0 ? rrfScore / maximumRrfScore : 0;
+      const lexicalScore = lexicalCoverage(questionTerms, record);
+      const baseScore = Math.max(0, Math.min(
+        1,
+        0.55 * relativeRrfScore + 0.30 * backendScore + 0.15 * lexicalScore,
+      ));
       const isNegative = feedbackContext?.negativeSourceIds.has(record.result_id) || false;
       const isPositive = feedbackContext?.positiveSourceIds.has(record.result_id) || false;
       const adjustedScore = isNegative
@@ -115,13 +200,44 @@ export async function retrieveEvidence(
           ? Math.min(1, baseScore + 0.12)
           : baseScore;
       return {
-        ...record,
+        record: {
+          ...record,
+          score: adjustedScore,
+          retrieval_score: baseScore,
+        },
+        order,
         score: adjustedScore,
-        retrieval_score: baseScore,
       };
     })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 100);
+    .sort((left, right) => right.score - left.score || left.order - right.order);
+  return reranked.map(({ record }) => record);
+}
+
+export async function lookupStructuredFacts(
+  query: NumericQuery,
+  documentId?: string,
+): Promise<RetrievedRecord[]> {
+  const { data, error } = await getSupabase().rpc("lookup_workbook_cells", {
+    p_row_terms: query.metricSearchTerms,
+    p_column_terms: query.columnSearchTerms || [],
+    p_period: query.columnSearchTerms?.length
+      ? null
+      : query.periods.length === 1
+        ? query.periods[0]
+        : query.periods.length === 0
+          ? query.fiscalYear
+          : null,
+    p_scope: query.scope,
+    p_sheet_name: query.sheetName || null,
+    p_row_number: query.rowNumber ?? null,
+    p_column_number: query.columnNumber ?? null,
+    p_target_document_id: documentId || null,
+    p_match_count: 1000,
+  });
+  if (error) {
+    throw new Error(`Supabase exact workbook cell lookup failed: ${error.message}`);
+  }
+  return (data || []) as RetrievedRecord[];
 }
 
 export function buildRetrievalQueries(question: string): string[] {

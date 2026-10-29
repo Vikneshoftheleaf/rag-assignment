@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from pathlib import Path
@@ -203,6 +204,30 @@ def markdown_fallback_chunks(markdown: str) -> list[dict[str, Any]]:
     return chunks
 
 
+def pdfium_fallback_chunks(path: Path) -> list[dict[str, Any]]:
+    """Extract page text with PDFium when Docling's native conversion fails."""
+    import pypdfium2
+
+    document = pypdfium2.PdfDocument(str(path))
+    chunks: list[dict[str, Any]] = []
+    try:
+        for page_number, page in enumerate(document, start=1):
+            text_page = page.get_textpage()
+            try:
+                page_text = text_page.get_text_range()
+            finally:
+                text_page.close()
+                page.close()
+            chunks.extend(
+                chunk_text(page_text, location={"page": page_number})
+            )
+    finally:
+        document.close()
+    if not chunks:
+        raise ValueError(f"PDFium could not extract text from {path.name}")
+    return chunks
+
+
 def _numeric(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -235,6 +260,15 @@ def _infer_scope(*labels: str) -> str | None:
 
 def _financial_period(header: str, filename_period: str | None, filename_fiscal_year: str | None) -> str | None:
     normalized_header = re.sub(r"\s+", " ", header).strip()
+    date = re.search(
+        r"\b(\d{1,2})[-\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-\s](\d{4})\b",
+        normalized_header,
+        re.I,
+    )
+    if re.search(r"\bas\s+at\b", normalized_header, re.I) and date:
+        day, month, year = date.groups()
+        return f"As at {int(day):02d}-{month.title()}-{year}"
+
     explicit = re.search(
         r"\b(Q[1-4]|H[1-2])(?:\s+FY\s*(\d{4}(?:[-–/]\d{2,4})?|\d{2}))?\b",
         normalized_header,
@@ -263,16 +297,11 @@ def _financial_period(header: str, filename_period: str | None, filename_fiscal_
         return period
 
     header_kind = re.search(r"\b(quarter|half[\s-]*year)\b", normalized_header, re.I)
-    date = re.search(
-        r"\b\d{1,2}[-\s](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-\s](\d{4})\b",
-        normalized_header,
-        re.I,
-    )
     period = filename_period.upper() if filename_period else None
     fiscal_year = filename_fiscal_year
     if date:
-        month = date.group(1).lower()
-        calendar_year = int(date.group(2))
+        month = date.group(2).lower()
+        calendar_year = int(date.group(3))
         fiscal_start = calendar_year if month in {
             "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
         } else calendar_year - 1
@@ -349,7 +378,8 @@ class _FormulaEvaluator:
             finally:
                 self.active.remove(key)
         else:
-            result = _numeric(self.value_book[sheet_name][coordinate].value)
+            value = self.value_book[sheet_name][coordinate].value
+            result = 0.0 if value is None else _numeric(value)
         self.cache[key] = result
         return result
 
@@ -368,21 +398,32 @@ class _FormulaEvaluator:
                 tokens.append((kind, match.group(kind)))
 
         class Parser:
-            def __init__(self, evaluator: _FormulaEvaluator) -> None:
+            def __init__(
+                self,
+                evaluator: _FormulaEvaluator,
+                formula_tokens: list[tuple[str, str]],
+            ) -> None:
                 self.evaluator = evaluator
+                self.tokens = formula_tokens
                 self.index = 0
 
             def peek(self, value: str | None = None) -> bool:
-                if self.index >= len(tokens):
+                if self.index >= len(self.tokens):
                     return False
-                return value is None or tokens[self.index][1] == value
+                return value is None or self.tokens[self.index][1] == value
 
             def take(self) -> tuple[str, str]:
-                if self.index >= len(tokens):
+                if self.index >= len(self.tokens):
                     raise ValueError("Unexpected end of formula")
-                token = tokens[self.index]
+                token = self.tokens[self.index]
                 self.index += 1
                 return token
+
+            def parse(self) -> float:
+                result = self.expression()
+                if self.index != len(self.tokens) or not math.isfinite(result):
+                    raise ValueError("Invalid or non-finite formula result")
+                return result
 
             def expression(self) -> float:
                 result = self.term()
@@ -424,23 +465,23 @@ class _FormulaEvaluator:
                     self.take()
                     return value
 
-                kind, value = tokens[self.index] if self.index < len(tokens) else ("", "")
+                kind, value = self.tokens[self.index] if self.index < len(self.tokens) else ("", "")
                 if kind == "number":
                     self.take()
                     return float(value)
                 if (
                     kind == "identifier"
                     and value.upper() == "SUM"
-                    and self.index + 1 < len(tokens)
-                    and tokens[self.index + 1][1] == "("
+                    and self.index + 1 < len(self.tokens)
+                    and self.tokens[self.index + 1][1] == "("
                 ):
                     self.take()
                     self.take()
                     total = 0.0
                     while True:
-                        if self.index >= len(tokens):
+                        if self.index >= len(self.tokens):
                             raise ValueError("Unclosed SUM")
-                        if tokens[self.index][0] in {"cell", "qualified"}:
+                        if self.tokens[self.index][0] in {"cell", "qualified"}:
                             first_sheet, first_cell = self.reference()
                             if self.peek(":"):
                                 self.take()
@@ -472,6 +513,38 @@ class _FormulaEvaluator:
                             raise ValueError("Invalid SUM arguments")
                         self.take()
                         return total
+                if (
+                    kind == "identifier"
+                    and value.upper() == "IFERROR"
+                    and self.index + 1 < len(self.tokens)
+                    and self.tokens[self.index + 1][1] == "("
+                ):
+                    self.take()
+                    self.take()
+                    first_start = self.index
+                    depth = 0
+                    separator = None
+                    closing = None
+                    for position in range(first_start, len(self.tokens)):
+                        token_value = self.tokens[position][1]
+                        if token_value == "(":
+                            depth += 1
+                        elif token_value == ")":
+                            if depth == 0:
+                                closing = position
+                                break
+                            depth -= 1
+                        elif token_value == "," and depth == 0 and separator is None:
+                            separator = position
+                    if separator is None or closing is None:
+                        raise ValueError("Invalid IFERROR arguments")
+                    first_argument = self.tokens[first_start:separator]
+                    fallback_argument = self.tokens[separator + 1:closing]
+                    self.index = closing + 1
+                    try:
+                        return Parser(self.evaluator, first_argument).parse()
+                    except (ArithmeticError, ValueError, KeyError, IndexError):
+                        return Parser(self.evaluator, fallback_argument).parse()
                 if kind in {"cell", "qualified"}:
                     sheet, coordinate = self.reference()
                     value = self.evaluator.cell_value(sheet, coordinate)
@@ -480,12 +553,8 @@ class _FormulaEvaluator:
                     return value
                 raise ValueError("Unsupported formula")
 
-        parser = Parser(self)
         try:
-            result = parser.expression()
-            if parser.index != len(tokens) or not math.isfinite(result):
-                return None
-            return result
+            return Parser(self, tokens).parse()
         except (ArithmeticError, ValueError, KeyError, IndexError):
             return None
 
@@ -494,8 +563,8 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     """Read numeric workbook cells, calculating supported formulas without treating blanks as zero."""
     from openpyxl import load_workbook
 
-    value_book = load_workbook(path, read_only=True, data_only=True)
-    formula_book = load_workbook(path, read_only=True, data_only=False)
+    value_book = load_workbook(path, read_only=False, data_only=True)
+    formula_book = load_workbook(path, read_only=False, data_only=False)
     evaluator = _FormulaEvaluator(value_book, formula_book)
     facts: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -549,7 +618,7 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
                             str(value) for value in candidate_values if value is not None
                         )
                         if re.search(
-                            r"\b(?:quarter|half[\s-]*year|Q[1-4]|H[1-2]|FY\s*\d{2,4})\b",
+                            r"\b(?:as\s+at|as\s+of|quarter|half[\s-]*year|Q[1-4]|H[1-2]|FY\s*\d{2,4})\b",
                             candidate_text,
                             re.I,
                         ):
@@ -564,18 +633,23 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
 
                     coordinate = f"{get_column_letter(column)}{first.row}"
                     cell_value = values_sheet.cell(row=first.row, column=column).value
-                    number = _numeric(cell_value)
                     formula = formula_book[values_sheet.title][coordinate].value
                     formula_evaluated = False
-                    if number is None and isinstance(formula, str) and formula.startswith("="):
+                    if isinstance(formula, str) and formula.startswith("="):
                         number = evaluator.cell_value(values_sheet.title, coordinate)
                         formula_evaluated = number is not None
+                    else:
+                        number = _numeric(cell_value)
                     if number is None:
                         continue
                     header = headers.get(column, "")
                     period = _financial_period(header, filename_period_text, filename_fiscal_year_text)
                     unit = _financial_unit(header, metric, sheet_context)
-                    value_text = str(cell_value).strip() if cell_value is not None else format(number, ".12g")
+                    value_text = (
+                        format(number, ".15g")
+                        if isinstance(formula, str) and formula.startswith("=")
+                        else str(cell_value).strip()
+                    )
                     facts.append({
                         "metric": f"{metric} — {header}" if header else metric,
                         "scope": _infer_scope(metric, header, values_sheet.title, path.name),
@@ -598,3 +672,344 @@ def spreadsheet_facts(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
         value_book.close()
         formula_book.close()
     return facts, warnings
+
+
+def _spreadsheet_header_row(values: list[Any]) -> bool:
+    populated = [value for value in values if value is not None]
+    if len(populated) < 2:
+        return False
+    first = str(populated[0]).strip().casefold()
+    recognized_label = bool(re.match(
+        r"^(?:particulars?|metric|field|ctc id|item|step|check id|control|"
+        r"sr\.?\s*no\.?|resolution no\.?|agenda item|description|parameter|"
+        r"segment|share class|cash flow activity|task id|action id)\b",
+        first,
+    ))
+    text = " ".join(str(value) for value in populated if isinstance(value, str))
+    has_period_header = bool(re.search(
+        r"\b(?:as\s+at|as\s+of|quarter ended|half year ended|Q[1-4]|H[1-2]|FY\s*\d{2,4})\b",
+        text,
+        re.I,
+    ))
+    if recognized_label:
+        return has_period_header or not any(
+            _looks_like_spreadsheet_value(value) for value in populated[1:]
+        )
+    return has_period_header and len(populated) >= 2
+
+
+def _looks_like_spreadsheet_value(value: Any) -> bool:
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)) or _numeric(value) is not None:
+        return True
+    text = str(value).strip()
+    return bool(
+        re.search(
+            r"\b\d{1,2}[-/\s](?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+            r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
+            r"Nov(?:ember)?|Dec(?:ember)?)[-/\s]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b",
+            text,
+            re.I,
+        )
+        or re.fullmatch(r"[A-Z]{2,}(?:[-_/][A-Z0-9]+)+", text, re.I)
+    )
+
+
+def _spreadsheet_form_labels(populated: list[Any]) -> dict[str, tuple[str, str]] | None:
+    if len(populated) < 4 or len(populated) % 2:
+        return None
+    labels = populated[::2]
+    values = populated[1::2]
+    if any(
+        not isinstance(cell.value, str) or _looks_like_spreadsheet_value(cell.value)
+        for cell in labels
+    ):
+        return None
+    if not any(_looks_like_spreadsheet_value(cell.value) for cell in values):
+        return None
+
+    field_labels: dict[str, tuple[str, str]] = {}
+    for label, value in zip(labels, values):
+        field_text = _spreadsheet_cell_text(label.value)
+        field_labels[label.coordinate] = (field_text, "Field")
+        field_labels[value.coordinate] = (field_text, "Value")
+    return field_labels
+
+
+def _spreadsheet_cell_text(value: Any) -> str:
+    from datetime import date, datetime
+
+    if value is None:
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, float):
+        return format(value, ".15g")
+    return str(value).strip()
+
+
+def spreadsheet_cells(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Extract populated cells with row labels and column-header paths."""
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+
+    value_book = load_workbook(path, read_only=False, data_only=True)
+    formula_book = load_workbook(path, read_only=False, data_only=False)
+    evaluator = _FormulaEvaluator(value_book, formula_book)
+    cells: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    filename_period = re.search(r"(?<![A-Za-z0-9])(Q[1-4]|H[1-2])(?![A-Za-z0-9])", path.stem, re.I)
+    filename_fiscal_year = re.search(r"(?<![A-Za-z0-9])FY\s*(\d{4}[-–/]\d{2,4})\b", path.stem, re.I)
+    filename_period_text = filename_period.group(1) if filename_period else None
+    filename_fiscal_year_text = (
+        filename_fiscal_year.group(1).replace("–", "-").replace("/", "-")
+        if filename_fiscal_year
+        else None
+    )
+    try:
+        for values_sheet in value_book.worksheets:
+            formulas_sheet = formula_book[values_sheet.title]
+            merged_headers: dict[int, dict[int, str]] = {}
+            for merged_range in formulas_sheet.merged_cells.ranges:
+                min_col, min_row, max_col, _ = merged_range.bounds
+                anchor = formulas_sheet.cell(min_row, min_col).value
+                if anchor is not None:
+                    for column in range(min_col, max_col + 1):
+                        merged_headers.setdefault(min_row, {})[column] = str(anchor).strip()
+
+            header_rows: dict[int, dict[int, str]] = {}
+            for row_number in range(1, values_sheet.max_row + 1):
+                row_values = [
+                    values_sheet.cell(row_number, column).value
+                    for column in range(1, values_sheet.max_column + 1)
+                ]
+                if not _spreadsheet_header_row(row_values):
+                    continue
+                header_rows[row_number] = {
+                    column: (
+                        str(values_sheet.cell(row_number, column).value).strip()
+                        if values_sheet.cell(row_number, column).value is not None
+                        else merged_headers.get(row_number, {}).get(column, "")
+                    )
+                    for column in range(1, values_sheet.max_column + 1)
+                    if values_sheet.cell(row_number, column).value is not None
+                    or column in merged_headers.get(row_number, {})
+                }
+
+            sheet_context = " ".join(
+                str(cell.value).strip()
+                for row in values_sheet.iter_rows(min_row=1, max_row=min(5, values_sheet.max_row))
+                for cell in row
+                if cell.value is not None and not isinstance(cell.value, (int, float, bool))
+            )
+            active_headers: dict[int, list[str]] = {}
+            for row in values_sheet.iter_rows():
+                row_number = row[0].row
+                if row_number in header_rows:
+                    for column, header in header_rows[row_number].items():
+                        if header:
+                            active_headers.setdefault(column, []).append(header)
+                            active_headers[column] = active_headers[column][-3:]
+                populated = [
+                    cell for cell in row
+                    if cell.value is not None or formulas_sheet[cell.coordinate].value is not None
+                ]
+                if not populated:
+                    continue
+                first = populated[0]
+                row_header = first.row in header_rows
+                row_label = _spreadsheet_cell_text(first.value)
+                row_header_text = header_rows.get(first.row, {})
+                if row_header:
+                    row_label = row_header_text.get(first.column, row_label)
+                form_labels = None if row_header else _spreadsheet_form_labels(populated)
+
+                for source_cell in populated:
+                    coordinate = source_cell.coordinate
+                    formula = formulas_sheet[coordinate].value
+                    formula_evaluated = False
+                    effective_value = source_cell.value
+                    if isinstance(formula, str) and formula.startswith("="):
+                        evaluated = evaluator.cell_value(values_sheet.title, coordinate)
+                        if evaluated is None:
+                            warnings.append(
+                                f"{values_sheet.title}!{coordinate}: formula result is unavailable or unsupported"
+                            )
+                        else:
+                            effective_value = evaluated
+                            formula_evaluated = True
+
+                    value_text = _spreadsheet_cell_text(effective_value)
+                    column = source_cell.column
+                    cell_row_label = row_label
+                    if form_labels and coordinate in form_labels:
+                        cell_row_label, form_column_header = form_labels[coordinate]
+                        column_headers = [form_column_header]
+                    else:
+                        column_headers = list(active_headers.get(column, []))
+                    if not column_headers:
+                        column_headers = [f"Column {get_column_letter(column)}"]
+                    column_header = " / ".join(column_headers)
+                    period = _financial_period(
+                        column_header,
+                        filename_period_text,
+                        filename_fiscal_year_text,
+                    )
+                    unit = _financial_unit(column_header, cell_row_label, sheet_context)
+                    numeric_value = _numeric(effective_value)
+                    cells.append({
+                        "sheet_name": values_sheet.title,
+                        "row_number": source_cell.row,
+                        "column_number": column,
+                        "cell_address": coordinate,
+                        "row_label": cell_row_label,
+                        "column_header": column_header,
+                        "column_headers": column_headers,
+                        "header_row": max(
+                            (row_num for row_num in header_rows if row_num < source_cell.row),
+                            default=None,
+                        ),
+                        "value_text": value_text,
+                        "numeric_value": numeric_value,
+                        "cell_type": (
+                            "formula" if isinstance(formula, str) and formula.startswith("=")
+                            else "numeric" if numeric_value is not None
+                            else "text"
+                        ),
+                        "period": period,
+                        "scope": _infer_scope(row_label, column_header, values_sheet.title, path.name),
+                        "unit": unit,
+                        "formula": formula if isinstance(formula, str) and formula.startswith("=") else None,
+                        "formula_evaluated": formula_evaluated,
+                        "source_location": {
+                            "sheet": values_sheet.title,
+                            "row": source_cell.row,
+                            "column": column,
+                            "cell": coordinate,
+                        },
+                        "metadata": {
+                            "row_header_cell": first.coordinate,
+                            "row_is_header": row_header,
+                            "column_headers": column_headers,
+                            **({"formula": formula, "formula_evaluated": formula_evaluated}
+                               if isinstance(formula, str) and formula.startswith("=") else {}),
+                        },
+                    })
+    finally:
+        value_book.close()
+        formula_book.close()
+    return cells, warnings
+
+
+def spreadsheet_chunks(
+    path: Path,
+    cells: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Create self-contained JSONL evidence records for every worksheet cell."""
+    from collections import defaultdict
+    from openpyxl.utils import get_column_letter
+
+    if cells is None:
+        cells, _ = spreadsheet_cells(path)
+    rows: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for cell in cells:
+        rows[(cell["sheet_name"], cell["row_number"])].append(cell)
+
+    chunks: list[dict[str, Any]] = []
+    for (sheet_name, row_number), row_cells in sorted(rows.items()):
+        row_cells.sort(key=lambda cell: cell["column_number"])
+        row_label = next(
+            (cell["row_label"] for cell in row_cells if cell["row_label"]),
+            f"Row {row_number}",
+        )
+        records = [
+            json.dumps(
+                {
+                    "type": "workbook_cell",
+                    "sheet": cell["sheet_name"],
+                    "row": cell["row_number"],
+                    "row_label": cell["row_label"],
+                    "column": get_column_letter(cell["column_number"]),
+                    "column_header": cell["column_header"],
+                    "cell": cell["cell_address"],
+                    "value": cell["value_text"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for cell in row_cells
+        ]
+        content = "\n\n".join(records)
+        location = {
+            "sheet": sheet_name,
+            "row": row_number,
+            "cell": row_cells[0]["cell_address"],
+            "cells": [cell["cell_address"] for cell in row_cells],
+        }
+        row_chunks = chunk_text(content, heading=f"Sheet: {sheet_name}", location=location)
+        for item in row_chunks:
+            item["metadata"] = {
+                **item.get("metadata", {}),
+                "sheet": sheet_name,
+                "row": row_number,
+                "row_label": row_label,
+            }
+        chunks.extend(row_chunks)
+    return chunks
+
+
+def spreadsheet_manifest(
+    path: Path,
+    facts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Record an auditable disposition for every worksheet in a workbook."""
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    facts_by_sheet: dict[str, int] = {}
+    for fact in facts:
+        sheet = fact.get("source_location", {}).get("sheet")
+        if isinstance(sheet, str):
+            facts_by_sheet[sheet] = facts_by_sheet.get(sheet, 0) + 1
+
+    manifest: list[dict[str, Any]] = []
+    try:
+        for worksheet in workbook.worksheets:
+            populated_cells = 0
+            numeric_cells = 0
+            formula_cells = 0
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    value = cell.value
+                    if value is None:
+                        continue
+                    populated_cells += 1
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, (int, float)) or _numeric(value) is not None:
+                        numeric_cells += 1
+                    if isinstance(value, str) and value.startswith("="):
+                        formula_cells += 1
+
+            is_dashboard = worksheet.title.strip().casefold() == "dashboard"
+            manifest.append({
+                "sheet": worksheet.title,
+                "state": worksheet.sheet_state,
+                "max_row": worksheet.max_row,
+                "max_column": worksheet.max_column,
+                "populated_cells": populated_cells,
+                "numeric_cells": numeric_cells,
+                "formula_cells": formula_cells,
+                "structured_fact_count": facts_by_sheet.get(worksheet.title, 0),
+                "disposition": (
+                    "dashboard_cells" if is_dashboard
+                    else "structured_facts" if facts_by_sheet.get(worksheet.title, 0)
+                    else "narrative_or_unstructured"
+                ),
+            })
+    finally:
+        workbook.close()
+    return manifest

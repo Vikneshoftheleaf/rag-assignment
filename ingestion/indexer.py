@@ -7,6 +7,7 @@ from collections import Counter
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.parse
 import urllib.error
@@ -21,6 +22,10 @@ from processor import (
     chunks_from_docling,
     document_type,
     markdown_fallback_chunks,
+    pdfium_fallback_chunks,
+    spreadsheet_chunks,
+    spreadsheet_cells,
+    spreadsheet_manifest,
     spreadsheet_facts,
 )
 
@@ -33,7 +38,7 @@ def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> di
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")[:1000]
@@ -153,23 +158,49 @@ def load_environment(env_file: Path | None = None) -> None:
     load_dotenv(config_path, override=False)
 
 
-def index_document(path: Path, docs_root: Path, dry_run: bool = False) -> tuple[int, int]:
-    exported, markdown = convert_document(path)
-    chunks = chunks_from_docling(exported)
-    if not chunks:
-        chunks = markdown_fallback_chunks(markdown)
+def index_document(
+    path: Path,
+    docs_root: Path,
+    dry_run: bool = False,
+    pdfium_fallback: bool = False,
+) -> tuple[int, int, int]:
     facts: list[dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
+    workbook_manifest: list[dict[str, Any]] = []
     if path.suffix.lower() == ".xlsx":
         facts, warnings = spreadsheet_facts(path)
+        cells, cell_warnings = spreadsheet_cells(path)
+        warnings.extend(cell_warnings)
+        chunks = spreadsheet_chunks(path, cells)
+        workbook_manifest = spreadsheet_manifest(path, facts)
         for warning in warnings:
             print(f"WARNING: {path.name}: {warning}", file=sys.stderr)
+    elif pdfium_fallback:
+        if path.suffix.lower() != ".pdf":
+            raise ValueError("PDFium fallback can only be used with PDF documents.")
+        chunks = pdfium_fallback_chunks(path)
+    else:
+        exported, markdown = convert_document(path)
+        chunks = chunks_from_docling(exported)
+        if not chunks:
+            chunks = markdown_fallback_chunks(markdown)
 
     source_path = path.relative_to(docs_root).as_posix()
     doc_type = document_type(path)
     checksum = checksum_file(path)
     if dry_run:
-        print(f"DRY RUN: {source_path} [{doc_type}] - {len(chunks)} chunks, {len(facts)} facts")
-        return len(chunks), len(facts)
+        print(
+            f"DRY RUN: {source_path} [{doc_type}] - {len(chunks)} chunks, "
+            f"{len(facts)} facts, {len(cells)} workbook cells"
+        )
+        for sheet in workbook_manifest:
+            print(
+                f"  SHEET: {sheet['sheet']} - {sheet['disposition']} "
+                f"({sheet['structured_fact_count']} facts, {sheet['populated_cells']} populated cells)"
+            )
+        if workbook_manifest:
+            print(f"  CELL INDEX: {len(cells)} populated cells with row/column labels")
+        return len(chunks), len(facts), len(cells)
 
     chunks = prepare_retrieval_chunks(
         chunks,
@@ -194,39 +225,67 @@ def index_document(path: Path, docs_root: Path, dry_run: bool = False) -> tuple[
     for index, fact in enumerate(facts):
         fact["fact_index"] = index
         fact["embedding"] = vectors[len(chunks) + index]
+    for index, cell in enumerate(cells):
+        cell["cell_index"] = index
 
     base_url = os.environ["SUPABASE_URL"].rstrip("/")
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    print(
+        f"Uploading {source_path}: {len(chunks)} chunks, "
+        f"{len(facts)} spreadsheet facts, {len(cells)} workbook cells"
+    )
     _post_json(
-        f"{base_url}/rest/v1/rpc/replace_document_index",
+        f"{base_url}/rest/v1/rpc/replace_document_index_v2",
         {"apikey": key, "Authorization": f"Bearer {key}"},
         {
             "p_source_path": source_path,
             "p_filename": path.name,
             "p_document_type": doc_type,
             "p_checksum": checksum,
-            "p_metadata": {"sha256": checksum, "fictional_corpus": True},
+            "p_metadata": {
+                "sha256": checksum,
+                "fictional_corpus": True,
+                **({"spreadsheet_manifest": workbook_manifest} if workbook_manifest else {}),
+            },
             "p_chunks": chunks,
             "p_facts": facts,
+            "p_cells": cells,
         },
     )
-    print(f"Indexed {source_path}: {len(chunks)} chunks, {len(facts)} spreadsheet facts")
-    return len(chunks), len(facts)
+    print(
+        f"Indexed {source_path}: {len(chunks)} chunks, {len(facts)} spreadsheet facts, "
+        f"{len(cells)} workbook cells"
+    )
+    return len(chunks), len(facts), len(cells)
 
 
 def main() -> int:
     load_environment()
     parser = argparse.ArgumentParser(description="Index supplied Silverline sample documents.")
     parser.add_argument("--docs-dir", default=os.getenv("DOCS_DIR", "./docs"), type=Path)
+    parser.add_argument("--file", type=Path, help="Index one supported document under --docs-dir.")
     parser.add_argument("--dry-run", action="store_true", help="Parse files and report counts without credentials or indexing.")
+    parser.add_argument("--pdfium-fallback", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = args.docs_dir.resolve()
     if not root.is_dir():
         parser.error(f"Documents directory does not exist: {root}")
-    paths = sorted(
-        path for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
+    if args.file:
+        selected_file = args.file.resolve()
+        if not selected_file.is_file():
+            parser.error(f"Document file does not exist: {selected_file}")
+        try:
+            selected_file.relative_to(root)
+        except ValueError:
+            parser.error(f"Document file must be under --docs-dir: {root}")
+        if selected_file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            parser.error(f"Unsupported document extension: {selected_file.suffix}")
+        paths = [selected_file]
+    else:
+        paths = sorted(
+            path for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
     if not paths:
         parser.error(f"No PDF, DOCX, or XLSX files found under {root}")
     if not args.dry_run:
@@ -236,12 +295,98 @@ def main() -> int:
         ]
         if missing:
             parser.error("Missing environment variables: " + ", ".join(missing))
-    chunk_count = fact_count = 0
+
+    if not args.file:
+        completed_count = 0
+        failures: list[Path] = []
+        for path in paths:
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--docs-dir",
+                str(root),
+                "--file",
+                str(path),
+            ]
+            if args.dry_run:
+                command.append("--dry-run")
+            try:
+                result = subprocess.run(command, check=False)
+            except OSError as error:
+                failures.append(path)
+                print(
+                    f"ERROR: Could not start indexing process for "
+                    f"{path.relative_to(root).as_posix()}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            if result.returncode != 0 and path.suffix.lower() == ".pdf":
+                print(
+                    f"WARNING: Docling worker failed for {path.name} "
+                    f"(exit code {result.returncode}); retrying text extraction with PDFium.",
+                    file=sys.stderr,
+                )
+                try:
+                    fallback_result = subprocess.run(
+                        [*command, "--pdfium-fallback"],
+                        check=False,
+                    )
+                except OSError as error:
+                    failures.append(path)
+                    print(
+                        f"ERROR: Could not start PDFium fallback for "
+                        f"{path.relative_to(root).as_posix()}: {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if fallback_result.returncode == 0:
+                    completed_count += 1
+                    continue
+                result = fallback_result
+            if result.returncode == 0:
+                completed_count += 1
+            else:
+                failures.append(path)
+                print(
+                    f"ERROR: Indexing process failed for {path.relative_to(root).as_posix()} "
+                    f"with exit code {result.returncode}.",
+                    file=sys.stderr,
+                )
+        print(
+            f"Done: {len(paths)} documents attempted, {completed_count} completed, "
+            f"{len(failures)} failed."
+        )
+        return 1 if failures else 0
+
+    chunk_count = fact_count = cell_count = completed_count = 0
+    failures: list[tuple[Path, Exception]] = []
     for path in paths:
-        chunks, facts = index_document(path, root, args.dry_run)
+        try:
+            chunks, facts, cells = index_document(
+                path,
+                root,
+                args.dry_run,
+                args.pdfium_fallback,
+            )
+        except Exception as error:
+            failures.append((path, error))
+            print(
+                f"ERROR: Failed to index {path.relative_to(root).as_posix()}: "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        completed_count += 1
         chunk_count += chunks
         fact_count += facts
-    print(f"Done: {len(paths)} documents, {chunk_count} chunks, {fact_count} facts.")
+        cell_count += cells
+    print(
+        f"Done: {len(paths)} documents attempted, {completed_count} completed, "
+        f"{chunk_count} chunks, {fact_count} facts, {cell_count} workbook cells."
+    )
+    if failures:
+        print(f"Failed documents: {len(failures)}", file=sys.stderr)
+        return 1
     return 0
 
 
